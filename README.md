@@ -170,6 +170,16 @@ MODE=binary BINARY_PATH=./llm-router ./deploy/start-router-ubuntu.sh
 SKIP_BUILD=1 ./deploy/start-router-ubuntu.sh
 ```
 
+If your server cargo is old and shows lockfile error like "lock file version 4 requires -Znext-lockfile-bump":
+
+```bash
+rm -f Cargo.lock
+cargo generate-lockfile
+cargo build --release
+```
+
+The Ubuntu run script already handles this automatically when using cargo mode.
+
 ## Security Notes
 
 - Change default admin password hash before production.

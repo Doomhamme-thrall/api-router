@@ -36,6 +36,32 @@ echo "==> ROUTER_BIND=${ROUTER_BIND}"
 echo "==> ROUTER_CONFIG=${ROUTER_CONFIG}"
 echo "==> MODE=${MODE}"
 
+run_cargo_with_lockfile_compat() {
+  local cargo_args=("$@")
+  local err_log
+  err_log="$(mktemp)"
+
+  # First attempt with existing lockfile.
+  if cargo "${cargo_args[@]}" 2> >(tee "${err_log}" >&2); then
+    rm -f "${err_log}"
+    return 0
+  fi
+
+  # Compatibility fallback for older cargo that cannot parse lockfile v4.
+  if grep -q "lock file version 4 requires" "${err_log}"; then
+    echo "[WARN] Detected Cargo.lock v4 incompatibility with current cargo." >&2
+    echo "[WARN] Re-generating lockfile using local cargo version..." >&2
+    rm -f Cargo.lock
+    cargo generate-lockfile
+    cargo "${cargo_args[@]}"
+    rm -f "${err_log}"
+    return 0
+  fi
+
+  rm -f "${err_log}"
+  return 1
+}
+
 run_with_cargo() {
   if ! command -v cargo >/dev/null 2>&1; then
     echo "[ERROR] cargo not found. Install Rust toolchain or use MODE=binary." >&2
@@ -44,11 +70,11 @@ run_with_cargo() {
 
   if [[ "${SKIP_BUILD}" != "1" ]]; then
     echo "==> Running cargo check..."
-    cargo check
+    run_cargo_with_lockfile_compat check
   fi
 
   echo "==> Starting router with cargo run"
-  exec cargo run
+  run_cargo_with_lockfile_compat run
 }
 
 run_with_binary() {
