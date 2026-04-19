@@ -1,0 +1,19 @@
+[Unit]
+Description=LLM Router Service
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/opt/llm-router
+ExecStart=/opt/llm-router/llm-router
+Restart=always
+RestartSec=3
+Environment=ROUTER_BIND=127.0.0.1:8080
+Environment=ROUTER_CONFIG=/opt/llm-router/config/router.json
+Environment=RUST_LOG=info
+NoNewPrivileges=true
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

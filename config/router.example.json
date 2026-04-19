@@ -1,0 +1,32 @@
+{
+  "admin": {
+    "username": "admin",
+    "password_sha256": "replace-with-sha256-of-admin-password"
+  },
+  "jwt_secret": "replace-this-with-a-strong-secret",
+  "client_api_keys": [
+    "replace-with-client-api-key"
+  ],
+  "targets": [
+    {
+      "id": "target-1",
+      "name": "provider-model-1",
+      "provider": "provider-name",
+      "base_url": "https://provider.example.com/v1",
+      "api_key": "replace-with-upstream-api-key",
+      "router_model": "router-model-name",
+      "upstream_model": "provider-model-name",
+      "enabled": true
+    }
+  ],
+  "model_groups": [
+    {
+      "id": "group-1",
+      "name": "test",
+      "target_ids": [
+        "target-1"
+      ],
+      "enabled": true
+    }
+  ]
+}

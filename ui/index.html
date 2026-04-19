@@ -1,0 +1,643 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>LLM Router Admin</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;600&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #f7f4eb;
+      --card: #fffef9;
+      --ink: #1f2d2a;
+      --muted: #5d6c67;
+      --line: #d8d2c0;
+      --accent: #0f766e;
+      --accent-2: #be123c;
+      --ok: #166534;
+      --warn: #9a3412;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Space Grotesk", sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 10% 10%, #f1e8d3 0%, transparent 35%),
+        radial-gradient(circle at 90% 20%, #d5f1eb 0%, transparent 30%),
+        linear-gradient(180deg, #fdfaf2 0%, #f3efe2 100%);
+      min-height: 100vh;
+    }
+    .wrap {
+      max-width: 1100px;
+      margin: 28px auto;
+      padding: 0 16px 40px;
+      animation: rise 420ms ease-out;
+    }
+    @keyframes rise {
+      from { opacity: 0; transform: translateY(10px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .hero {
+      display: flex;
+      gap: 12px;
+      align-items: baseline;
+      justify-content: space-between;
+      margin-bottom: 18px;
+    }
+    h1 {
+      margin: 0;
+      font-size: 30px;
+      letter-spacing: -0.02em;
+    }
+    .sub {
+      color: var(--muted);
+      font-size: 14px;
+      font-family: "IBM Plex Mono", monospace;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 16px;
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 16px;
+      box-shadow: 0 8px 20px rgba(31, 45, 42, 0.06);
+    }
+    .row {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(140px, 1fr));
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+    label {
+      display: block;
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 4px;
+      font-family: "IBM Plex Mono", monospace;
+    }
+    input, button, select {
+      width: 100%;
+      border: 1px solid var(--line);
+      background: #fff;
+      color: var(--ink);
+      border-radius: 10px;
+      font-size: 14px;
+      padding: 10px 11px;
+      font-family: inherit;
+    }
+    button {
+      cursor: pointer;
+      background: var(--accent);
+      color: #fff;
+      border-color: var(--accent);
+      transition: transform .12s ease, opacity .12s ease;
+    }
+    button:hover { transform: translateY(-1px); }
+    button.secondary {
+      background: #fff;
+      color: var(--ink);
+      border-color: var(--line);
+    }
+    button.danger {
+      background: var(--accent-2);
+      border-color: var(--accent-2);
+    }
+    .toolbar {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .status {
+      padding: 8px 10px;
+      border-radius: 10px;
+      font-size: 12px;
+      margin-top: 10px;
+      font-family: "IBM Plex Mono", monospace;
+      border: 1px solid var(--line);
+      background: #fff;
+    }
+    .targets {
+      display: grid;
+      gap: 10px;
+    }
+    .target {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 12px;
+      background: #fff;
+      display: grid;
+      gap: 8px;
+    }
+    .target-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      align-items: center;
+    }
+    .pill {
+      border-radius: 999px;
+      padding: 4px 8px;
+      font-size: 11px;
+      font-family: "IBM Plex Mono", monospace;
+      border: 1px solid var(--line);
+    }
+    .on { color: var(--ok); border-color: #86efac; background: #f0fdf4; }
+    .off { color: var(--warn); border-color: #fdba74; background: #fff7ed; }
+    .mono {
+      font-family: "IBM Plex Mono", monospace;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .picker {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(120px, 1fr));
+      gap: 8px;
+      margin: 8px 0 10px;
+    }
+    .pick-item {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 8px;
+      background: #fff;
+      font-size: 12px;
+      font-family: "IBM Plex Mono", monospace;
+    }
+    .pick-item input {
+      width: auto;
+      margin: 0;
+    }
+    @media (max-width: 760px) {
+      .row { grid-template-columns: 1fr; }
+      .picker { grid-template-columns: 1fr; }
+      h1 { font-size: 24px; }
+    }
+  </style>
+</head>
+<body>
+  <div id="loginView" class="wrap" style="max-width: 520px;">
+    <section class="card">
+      <div class="hero" style="margin-bottom: 10px;">
+        <h1>LLM Router Admin</h1>
+      </div>
+      <div class="sub" style="margin-bottom: 14px;">Please sign in to continue</div>
+      <div class="row">
+        <div>
+          <label>Username</label>
+          <input id="username" value="admin" />
+        </div>
+        <div>
+          <label>Password</label>
+          <input id="password" type="password" placeholder="admin123" />
+        </div>
+      </div>
+      <div class="toolbar">
+        <button onclick="login()">Sign In</button>
+      </div>
+      <div id="loginStatus" class="status">Not logged in</div>
+    </section>
+  </div>
+
+  <div id="appView" class="wrap" style="display:none;">
+    <div class="hero">
+      <h1>LLM Router Admin</h1>
+      <div class="sub">Global Round-Robin / OpenAI Compatible</div>
+    </div>
+
+    <div class="grid">
+      <section class="card">
+        <h3>Session</h3>
+        <div class="toolbar">
+          <button class="secondary" onclick="refreshAll()">Refresh All</button>
+          <button class="danger" onclick="logout()">Sign Out</button>
+        </div>
+        <div id="appStatus" class="status">Ready</div>
+      </section>
+
+      <section class="card">
+        <h3>Add Target</h3>
+        <div class="row">
+          <div><label>Name</label><input id="f_name" placeholder="OpenAI Primary" /></div>
+          <div><label>Provider</label><input id="f_provider" placeholder="openai" /></div>
+          <div><label>Base URL</label><input id="f_base_url" placeholder="https://api.openai.com" /></div>
+          <div><label>API Key</label><input id="f_api_key" placeholder="sk-..." /></div>
+          <div><label>Router Model</label><input id="f_router_model" placeholder="router-default" /></div>
+          <div><label>Upstream Model</label><input id="f_upstream_model" placeholder="gpt-4o-mini" /></div>
+        </div>
+        <div class="toolbar">
+          <button onclick="createTarget()">Create Target</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <h3>Targets</h3>
+        <div id="targets" class="targets"></div>
+      </section>
+
+      <section class="card">
+        <h3>Add Model Group</h3>
+        <div class="row">
+          <div><label>Group Name</label><input id="g_name" placeholder="team-default" /></div>
+          <div>
+            <label>Enabled</label>
+            <select id="g_enabled">
+              <option value="true" selected>true</option>
+              <option value="false">false</option>
+            </select>
+          </div>
+        </div>
+        <label>Pick Targets (group members)</label>
+        <div id="targetPicker" class="picker"></div>
+        <div class="toolbar">
+          <button onclick="createModelGroup()">Create Model Group</button>
+          <button class="secondary" onclick="refreshModelGroups()">Refresh Groups</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <h3>Model Groups</h3>
+        <div id="modelGroups" class="targets"></div>
+      </section>
+    </div>
+  </div>
+
+<script>
+  const state = {
+    token: localStorage.getItem("admin_token") || "",
+    targets: [],
+    groups: []
+  };
+
+  function setStatus(id, msg) {
+    document.getElementById(id).textContent = msg;
+  }
+
+  function setLoginStatus(msg) {
+    setStatus("loginStatus", msg);
+  }
+
+  function setAppStatus(msg) {
+    setStatus("appStatus", msg);
+  }
+
+  function updateView() {
+    const loggedIn = Boolean(state.token);
+    document.getElementById("loginView").style.display = loggedIn ? "none" : "block";
+    document.getElementById("appView").style.display = loggedIn ? "block" : "none";
+  }
+
+  function authHeaders() {
+    const headers = { "Content-Type": "application/json" };
+    if (state.token) headers["Authorization"] = `Bearer ${state.token}`;
+    return headers;
+  }
+
+  async function login() {
+    const username = document.getElementById("username").value.trim();
+    const password = document.getElementById("password").value;
+    const res = await fetch("/admin/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, password })
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      setLoginStatus(`Login failed: ${data?.error?.message || res.status}`);
+      return;
+    }
+    state.token = data.token;
+    localStorage.setItem("admin_token", state.token);
+    setLoginStatus(`Login ok. token expires at ${new Date(data.expires_at * 1000).toLocaleString()}`);
+    updateView();
+    await refreshAll();
+  }
+
+  function logout() {
+    state.token = "";
+    localStorage.removeItem("admin_token");
+    document.getElementById("targets").innerHTML = "";
+    document.getElementById("modelGroups").innerHTML = "";
+    document.getElementById("targetPicker").innerHTML = "";
+    setLoginStatus("Signed out");
+    updateView();
+  }
+
+  async function refreshAll() {
+    await refreshTargets();
+    await refreshModelGroups();
+  }
+
+  async function refreshTargets() {
+    if (!state.token) {
+      setLoginStatus("Please login first");
+      updateView();
+      return;
+    }
+    const res = await fetch("/admin/targets", { headers: authHeaders() });
+    const data = await res.json();
+    if (!res.ok) {
+      setAppStatus(`Load targets failed: ${data?.error?.message || res.status}`);
+      return;
+    }
+    state.targets = data.items || [];
+    renderTargets(state.targets);
+    renderTargetPicker(state.targets);
+  }
+
+  function readForm() {
+    return {
+      name: document.getElementById("f_name").value.trim(),
+      provider: document.getElementById("f_provider").value.trim(),
+      base_url: document.getElementById("f_base_url").value.trim(),
+      api_key: document.getElementById("f_api_key").value.trim(),
+      router_model: document.getElementById("f_router_model").value.trim(),
+      upstream_model: document.getElementById("f_upstream_model").value.trim(),
+      enabled: true
+    };
+  }
+
+  async function createTarget() {
+    if (!state.token) {
+      setLoginStatus("Please login first");
+      updateView();
+      return;
+    }
+    const payload = readForm();
+    const res = await fetch("/admin/targets", {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify(payload)
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      setAppStatus(`Create target failed: ${data?.error?.message || res.status}`);
+      return;
+    }
+    setAppStatus(`Target created: ${data.id}`);
+    await refreshAll();
+  }
+
+  function getTargetPayloadByIndex(index) {
+    return {
+      name: document.getElementById(`t_name_${index}`).value.trim(),
+      provider: document.getElementById(`t_provider_${index}`).value.trim(),
+      base_url: document.getElementById(`t_base_url_${index}`).value.trim(),
+      api_key: document.getElementById(`t_api_key_${index}`).value.trim(),
+      router_model: document.getElementById(`t_router_model_${index}`).value.trim(),
+      upstream_model: document.getElementById(`t_upstream_model_${index}`).value.trim(),
+      enabled: document.getElementById(`t_enabled_${index}`).value === "true"
+    };
+  }
+
+  async function saveTargetByButton(btn) {
+    const id = btn.dataset.id;
+    const index = Number(btn.dataset.index);
+    const payload = getTargetPayloadByIndex(index);
+    const res = await fetch(`/admin/targets/${id}`, {
+      method: "PUT",
+      headers: authHeaders(),
+      body: JSON.stringify(payload)
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      setAppStatus(`Update target failed: ${data?.error?.message || res.status}`);
+      return;
+    }
+    setAppStatus(`Target updated: ${payload.name}`);
+    await refreshAll();
+  }
+
+  async function deleteTargetByButton(btn) {
+    const id = btn.dataset.id;
+    if (!confirm("Delete this target?")) return;
+    const res = await fetch(`/admin/targets/${id}`, {
+      method: "DELETE",
+      headers: authHeaders()
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      setAppStatus(`Delete target failed: ${data?.error?.message || res.status}`);
+      return;
+    }
+    setAppStatus("Target deleted");
+    await refreshAll();
+  }
+
+  async function refreshModelGroups() {
+    if (!state.token) {
+      setLoginStatus("Please login first");
+      updateView();
+      return;
+    }
+    const res = await fetch("/admin/model-groups", { headers: authHeaders() });
+    const data = await res.json();
+    if (!res.ok) {
+      setAppStatus(`Load groups failed: ${data?.error?.message || res.status}`);
+      return;
+    }
+    state.groups = data.items || [];
+    renderModelGroups(state.groups);
+  }
+
+  function renderTargetPicker(items) {
+    const root = document.getElementById("targetPicker");
+    if (!items.length) {
+      root.innerHTML = '<div class="mono">Create targets first.</div>';
+      return;
+    }
+    root.innerHTML = items.map(t => `
+      <label class="pick-item">
+        <input type="checkbox" class="group-target-checkbox" value="${escapeHtml(t.id)}" />
+        <span>${escapeHtml(t.name)}</span>
+      </label>
+    `).join("");
+  }
+
+  function readGroupForm() {
+    const target_ids = Array.from(document.querySelectorAll(".group-target-checkbox:checked")).map(el => el.value);
+    return {
+      name: document.getElementById("g_name").value.trim(),
+      target_ids,
+      enabled: document.getElementById("g_enabled").value === "true"
+    };
+  }
+
+  async function createModelGroup() {
+    if (!state.token) {
+      setLoginStatus("Please login first");
+      updateView();
+      return;
+    }
+    const payload = readGroupForm();
+    const res = await fetch("/admin/model-groups", {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify(payload)
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      setAppStatus(`Create group failed: ${data?.error?.message || res.status}`);
+      return;
+    }
+    setAppStatus(`Model group created: ${data.name}`);
+    await refreshModelGroups();
+  }
+
+  function getGroupPayloadByIndex(index) {
+    const selected = Array.from(document.querySelectorAll(`.group-edit-target-${index}:checked`)).map(el => el.value);
+    return {
+      name: document.getElementById(`mg_name_${index}`).value.trim(),
+      target_ids: selected,
+      enabled: document.getElementById(`mg_enabled_${index}`).value === "true"
+    };
+  }
+
+  async function saveModelGroupByButton(btn) {
+    const id = btn.dataset.id;
+    const index = Number(btn.dataset.index);
+    const payload = getGroupPayloadByIndex(index);
+    const res = await fetch(`/admin/model-groups/${id}`, {
+      method: "PUT",
+      headers: authHeaders(),
+      body: JSON.stringify(payload)
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      setAppStatus(`Update group failed: ${data?.error?.message || res.status}`);
+      return;
+    }
+    setAppStatus(`Model group updated: ${payload.name}`);
+    await refreshModelGroups();
+  }
+
+  async function deleteModelGroupByButton(btn) {
+    const id = btn.dataset.id;
+    if (!confirm("Delete this model group?")) return;
+    const res = await fetch(`/admin/model-groups/${id}`, {
+      method: "DELETE",
+      headers: authHeaders()
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      setAppStatus(`Delete group failed: ${data?.error?.message || res.status}`);
+      return;
+    }
+    setAppStatus("Model group deleted");
+    await refreshModelGroups();
+  }
+
+  function renderTargets(items) {
+    const root = document.getElementById("targets");
+    if (!items.length) {
+      root.innerHTML = '<div class="mono">No targets found.</div>';
+      return;
+    }
+
+    root.innerHTML = items.map((t, index) => `
+      <div class="target">
+        <div class="target-head">
+          <strong>${escapeHtml(t.name)}</strong>
+          <span class="pill ${t.enabled ? "on" : "off"}">${t.enabled ? "ENABLED" : "DISABLED"}</span>
+        </div>
+        <div class="mono">id=${escapeHtml(t.id)}</div>
+        <div class="row" style="margin-bottom: 2px;">
+          <div><label>Name</label><input id="t_name_${index}" value="${escapeHtml(t.name)}" /></div>
+          <div><label>Provider</label><input id="t_provider_${index}" value="${escapeHtml(t.provider)}" /></div>
+          <div><label>Base URL</label><input id="t_base_url_${index}" value="${escapeHtml(t.base_url)}" /></div>
+          <div><label>API Key</label><input id="t_api_key_${index}" value="${escapeHtml(t.api_key)}" /></div>
+          <div><label>Router Model</label><input id="t_router_model_${index}" value="${escapeHtml(t.router_model)}" /></div>
+          <div><label>Upstream Model</label><input id="t_upstream_model_${index}" value="${escapeHtml(t.upstream_model)}" /></div>
+          <div>
+            <label>Enabled</label>
+            <select id="t_enabled_${index}">
+              <option value="true" ${t.enabled ? "selected" : ""}>true</option>
+              <option value="false" ${t.enabled ? "" : "selected"}>false</option>
+            </select>
+          </div>
+        </div>
+        <div class="toolbar">
+          <button class="secondary" data-id="${escapeHtml(t.id)}" data-index="${index}" onclick="saveTargetByButton(this)">Save</button>
+          <button class="danger" data-id="${escapeHtml(t.id)}" onclick="deleteTargetByButton(this)">Delete</button>
+        </div>
+      </div>
+    `).join("");
+  }
+
+  function renderModelGroups(items) {
+    const root = document.getElementById("modelGroups");
+    if (!items.length) {
+      root.innerHTML = '<div class="mono">No model groups found.</div>';
+      return;
+    }
+
+    root.innerHTML = items.map((g, index) => {
+      const options = (state.targets || []).map(t => {
+        const checked = (g.target_ids || []).includes(t.id) ? "checked" : "";
+        return `
+          <label class="pick-item">
+            <input type="checkbox" class="group-edit-target-${index}" value="${escapeHtml(t.id)}" ${checked} />
+            <span>${escapeHtml(t.name)}</span>
+          </label>
+        `;
+      }).join("");
+
+      return `
+      <div class="target">
+        <div class="target-head">
+          <strong>${escapeHtml(g.name)}</strong>
+          <span class="pill ${g.enabled ? "on" : "off"}">${g.enabled ? "ENABLED" : "DISABLED"}</span>
+        </div>
+        <div class="mono">id=${escapeHtml(g.id)}</div>
+        <div class="row" style="margin-bottom: 2px;">
+          <div><label>Group Name</label><input id="mg_name_${index}" value="${escapeHtml(g.name)}" /></div>
+          <div>
+            <label>Enabled</label>
+            <select id="mg_enabled_${index}">
+              <option value="true" ${g.enabled ? "selected" : ""}>true</option>
+              <option value="false" ${g.enabled ? "" : "selected"}>false</option>
+            </select>
+          </div>
+        </div>
+        <label>Group Members</label>
+        <div class="picker">${options || '<div class="mono">No targets available.</div>'}</div>
+        <div class="toolbar">
+          <button class="secondary" data-id="${escapeHtml(g.id)}" data-index="${index}" onclick="saveModelGroupByButton(this)">Save</button>
+          <button class="danger" data-id="${escapeHtml(g.id)}" onclick="deleteModelGroupByButton(this)">Delete</button>
+        </div>
+      </div>
+      `;
+    }).join("");
+  }
+
+  function escapeHtml(text) {
+    return String(text)
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#039;");
+  }
+
+  (async function boot() {
+    updateView();
+    if (!state.token) return;
+    await refreshAll();
+  })();
+
+  document.getElementById("password").addEventListener("keydown", async (event) => {
+    if (event.key === "Enter") {
+      await login();
+    }
+  });
+</script>
+</body>
+</html>
