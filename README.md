@@ -139,6 +139,37 @@ sudo ln -s /etc/nginx/sites-available/llm-router /etc/nginx/sites-enabled/llm-ro
 sudo nginx -t && sudo systemctl reload nginx
 ```
 
+## Ubuntu Run Script
+
+Project includes a helper script:
+
+- [deploy/start-router-ubuntu.sh](deploy/start-router-ubuntu.sh)
+
+Make it executable:
+
+```bash
+chmod +x deploy/start-router-ubuntu.sh
+```
+
+Run with defaults:
+
+```bash
+./deploy/start-router-ubuntu.sh
+```
+
+Common options via environment variables:
+
+```bash
+# Bind to all interfaces
+BIND_ADDR=0.0.0.0:8080 ./deploy/start-router-ubuntu.sh
+
+# Use binary mode (no cargo required)
+MODE=binary BINARY_PATH=./llm-router ./deploy/start-router-ubuntu.sh
+
+# Skip cargo check
+SKIP_BUILD=1 ./deploy/start-router-ubuntu.sh
+```
+
 ## Security Notes
 
 - Change default admin password hash before production.
