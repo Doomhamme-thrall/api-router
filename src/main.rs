@@ -11,7 +11,7 @@ use std::{
 use anyhow::Context;
 use axum::{
     body::Body,
-    extract::{Path as AxumPath, State},
+    extract::{Path as AxumPath, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Redirect, Response},
     routing::{get, post, put},
@@ -36,6 +36,37 @@ struct AppState {
     group_rr_index: Arc<RwLock<HashMap<String, usize>>>,
     http_client: Client,
     upstream_timeout_secs: u64,
+    call_records: Arc<RwLock<Vec<CallRecord>>>,
+    max_call_records: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CallRecord {
+    target_id: String,
+    target_name: String,
+    timestamp: i64,
+    success: bool,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    total_tokens: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct TargetStats {
+    target_id: String,
+    target_name: String,
+    total_calls: u64,
+    success_count: u64,
+    error_count: u64,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    total_tokens: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct StatsQuery {
+    from: Option<i64>,
+    to: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,6 +165,11 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(45);
 
+    let max_call_records = std::env::var("ROUTER_MAX_CALL_RECORDS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(100_000);
+
     let state = AppState {
         cfg_path,
         cfg: Arc::new(RwLock::new(cfg)),
@@ -146,6 +182,8 @@ async fn main() -> anyhow::Result<()> {
             .build()
             .context("failed to build reqwest client")?,
         upstream_timeout_secs,
+        call_records: Arc::new(RwLock::new(Vec::new())),
+        max_call_records,
     };
 
     let app = Router::new()
@@ -168,6 +206,8 @@ async fn main() -> anyhow::Result<()> {
             "/admin/model-groups/:id",
             put(admin_update_model_group).delete(admin_delete_model_group),
         )
+        .route("/admin/test-target/:id", get(admin_test_target))
+        .route("/admin/stats", get(admin_get_stats))
         .nest_service("/ui", ServeDir::new("ui"))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
@@ -285,6 +325,7 @@ async fn proxy_openai_request(
         );
     }
 
+    let is_streaming = payload.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
     let mut last_err_message = String::from("upstream request failed");
 
     for target in candidates {
@@ -305,6 +346,7 @@ async fn proxy_openai_request(
             Err(err) => {
                 last_err_message = format!("upstream request failed: {}", err);
                 error!("{}", last_err_message);
+                record_call(&state, &target, false, 0, 0, 0).await;
                 continue;
             }
         };
@@ -313,6 +355,7 @@ async fn proxy_openai_request(
         if status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS {
             last_err_message = format!("upstream status {}", status);
             error!("{}", last_err_message);
+            record_call(&state, &target, false, 0, 0, 0).await;
             continue;
         }
 
@@ -322,21 +365,42 @@ async fn proxy_openai_request(
             .cloned()
             .unwrap_or_else(|| HeaderValue::from_static("application/json"));
 
-        let stream = upstream_resp.bytes_stream();
-        let body = Body::from_stream(stream.map(|chunk| match chunk {
-            Ok(bytes) => Ok(bytes),
-            Err(err) => {
-                error!("streaming error: {}", err);
-                Err(std::io::Error::new(std::io::ErrorKind::Other, "stream read failed"))
+        if !is_streaming {
+            match upstream_resp.bytes().await {
+                Ok(bytes) => {
+                    let (pt, ct, tt) = extract_tokens_from_bytes(&bytes);
+                    record_call(&state, &target, true, pt, ct, tt).await;
+                    let body = Body::from(bytes);
+                    let mut response = Response::new(body);
+                    *response.status_mut() = status;
+                    response.headers_mut().insert("content-type", content_type);
+                    return response;
+                }
+                Err(err) => {
+                    last_err_message = format!("failed to read response body: {}", err);
+                    error!("{}", last_err_message);
+                    record_call(&state, &target, false, 0, 0, 0).await;
+                    continue;
+                }
             }
-        }));
+        } else {
+            record_call(&state, &target, true, 0, 0, 0).await;
+            let stream = upstream_resp.bytes_stream();
+            let body = Body::from_stream(stream.map(|chunk| match chunk {
+                Ok(bytes) => Ok(bytes),
+                Err(err) => {
+                    error!("streaming error: {}", err);
+                    Err(std::io::Error::new(std::io::ErrorKind::Other, "stream read failed"))
+                }
+            }));
 
-        let mut response = Response::new(body);
-        *response.status_mut() = status;
-        response
-            .headers_mut()
-            .insert("content-type", content_type);
-        return response;
+            let mut response = Response::new(body);
+            *response.status_mut() = status;
+            response
+                .headers_mut()
+                .insert("content-type", content_type);
+            return response;
+        }
     }
 
     api_error(StatusCode::BAD_GATEWAY, &last_err_message)
@@ -444,6 +508,43 @@ async fn pick_target_candidates_from_group(state: &AppState, group_name: &str) -
     *counter = counter.wrapping_add(1);
 
     rotate_targets(candidates, idx)
+}
+
+async fn record_call(
+    state: &AppState,
+    target: &UpstreamTarget,
+    success: bool,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    total_tokens: u64,
+) {
+    let record = CallRecord {
+        target_id: target.id.clone(),
+        target_name: target.name.clone(),
+        timestamp: Utc::now().timestamp(),
+        success,
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+    };
+    let mut records = state.call_records.write().await;
+    records.push(record);
+    if records.len() > state.max_call_records {
+        let drain = records.len() - state.max_call_records;
+        records.drain(0..drain);
+    }
+}
+
+fn extract_tokens_from_bytes(bytes: &[u8]) -> (u64, u64, u64) {
+    if let Ok(v) = serde_json::from_slice::<Value>(bytes) {
+        if let Some(usage) = v.get("usage") {
+            let prompt = usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+            let completion = usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+            let total = usage.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+            return (prompt, completion, total);
+        }
+    }
+    (0, 0, 0)
 }
 
 fn api_error(status: StatusCode, message: &str) -> Response {
@@ -764,6 +865,111 @@ async fn require_admin(
         Ok(_) => Ok(()),
         Err(_) => Err(api_error(StatusCode::UNAUTHORIZED, "invalid token")),
     }
+}
+
+async fn admin_test_target(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(resp) = require_admin(&state, &headers).await {
+        return resp;
+    }
+
+    let target = {
+        let cfg = state.cfg.read().await;
+        cfg.targets.iter().find(|t| t.id == id).cloned()
+    };
+
+    let Some(target) = target else {
+        return api_error(StatusCode::NOT_FOUND, "target not found");
+    };
+
+    let payload = json!({
+        "model": target.upstream_model,
+        "messages": [{"role": "user", "content": "Say hi."}],
+        "max_tokens": 50,
+        "stream": false
+    });
+
+    let upstream_url = build_upstream_url(&target.base_url, "chat/completions");
+    let result = state
+        .http_client
+        .post(&upstream_url)
+        .header("Authorization", format!("Bearer {}", target.api_key))
+        .header("Content-Type", "application/json")
+        .timeout(std::time::Duration::from_secs(30))
+        .json(&payload)
+        .send()
+        .await;
+
+    match result {
+        Err(err) => Json(json!({
+            "ok": false,
+            "error": format!("request failed: {}", err)
+        }))
+        .into_response(),
+        Ok(resp) => {
+            let status = resp.status();
+            match resp.json::<Value>().await {
+                Err(err) => Json(json!({
+                    "ok": false,
+                    "error": format!("failed to read response: {}", err)
+                }))
+                .into_response(),
+                Ok(body) => {
+                    if status.is_success() {
+                        Json(json!({"ok": true, "response": body})).into_response()
+                    } else {
+                        Json(json!({"ok": false, "error": body})).into_response()
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn admin_get_stats(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<StatsQuery>,
+) -> Response {
+    if let Err(resp) = require_admin(&state, &headers).await {
+        return resp;
+    }
+
+    let records = state.call_records.read().await;
+    let from = query.from.unwrap_or(0);
+    let to = query.to.unwrap_or(i64::MAX);
+
+    let mut agg: HashMap<String, TargetStats> = HashMap::new();
+
+    for record in records.iter().filter(|r| r.timestamp >= from && r.timestamp <= to) {
+        let entry = agg.entry(record.target_id.clone()).or_insert(TargetStats {
+            target_id: record.target_id.clone(),
+            target_name: record.target_name.clone(),
+            total_calls: 0,
+            success_count: 0,
+            error_count: 0,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+        });
+        entry.total_calls += 1;
+        if record.success {
+            entry.success_count += 1;
+        } else {
+            entry.error_count += 1;
+        }
+        entry.prompt_tokens += record.prompt_tokens;
+        entry.completion_tokens += record.completion_tokens;
+        entry.total_tokens += record.total_tokens;
+    }
+
+    let mut stats: Vec<TargetStats> = agg.into_values().collect();
+    stats.sort_by(|a, b| a.target_name.cmp(&b.target_name));
+
+    Json(json!({"items": stats})).into_response()
 }
 
 fn sha256_hex(input: &str) -> String {
