@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BIND_ADDR="${BIND_ADDR:-127.0.0.1:8080}"
+BIND_ADDR="${BIND_ADDR:-0.0.0.0:8080}"
 CONFIG_PATH="${CONFIG_PATH:-config/router.json}"
 RUST_LOG="${RUST_LOG:-info}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
