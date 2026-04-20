@@ -180,6 +180,23 @@ cargo build --release
 
 The Ubuntu run script already handles this automatically when using cargo mode.
 
+## GitHub Actions Auto Build
+
+Repository includes workflow:
+
+- `.github/workflows/build-linux.yml`
+
+When new code is pushed, GitHub Actions automatically builds:
+
+- target: `x86_64-unknown-linux-gnu`
+- binary: `llm-router`
+
+Download steps:
+
+1. Open repository `Actions` tab.
+2. Open latest `Build Linux Binary` run.
+3. Download artifact named `llm-router-linux-x86_64-<commit_sha>`.
+
 ## Security Notes
 
 - Change default admin password hash before production.
