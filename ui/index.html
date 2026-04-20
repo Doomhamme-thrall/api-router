@@ -322,12 +322,27 @@
         <h3>Usage Statistics</h3>
         <div class="sub" style="margin-bottom:12px;">Statistics are in-memory and reset on server restart. Token counts are available for non-streaming calls.</div>
         <div class="row">
-          <div><label>From (date)</label><input type="date" id="stats_from" /></div>
-          <div><label>To (date)</label><input type="date" id="stats_to" /></div>
+          <div>
+            <label>Time Range</label>
+            <select id="stats_preset" onchange="onStatsPresetChange()">
+              <option value="1800">Last 30 minutes</option>
+              <option value="3600">Last 1 hour</option>
+              <option value="10800">Last 3 hours</option>
+              <option value="43200">Last 12 hours</option>
+              <option value="86400" selected>Last 1 day</option>
+              <option value="604800">Last 7 days</option>
+              <option value="custom">Custom range</option>
+            </select>
+          </div>
+          <div class="mono" style="display:flex;align-items:flex-end;">Default view uses the last 24 hours.</div>
+        </div>
+        <div class="row" id="stats_custom_range" style="display:none;">
+          <div><label>From (date-time)</label><input type="datetime-local" id="stats_from" /></div>
+          <div><label>To (date-time)</label><input type="datetime-local" id="stats_to" /></div>
         </div>
         <div class="toolbar">
           <button onclick="loadStats()">Load Stats</button>
-          <button class="secondary" onclick="clearStatsFilter()">Clear Filter</button>
+          <button class="secondary" onclick="clearStatsFilter()">Reset to 24h</button>
         </div>
         <div id="statsTable" style="margin-top:14px;overflow-x:auto;"></div>
       </section>
@@ -338,7 +353,8 @@
   const state = {
     token: localStorage.getItem("admin_token") || "",
     targets: [],
-    groups: []
+    groups: [],
+    statsLoaded: false
   };
 
   function setStatus(id, msg) {
@@ -372,6 +388,9 @@
     document.querySelectorAll(".tab-btn").forEach(btn => {
       btn.classList.toggle("active", btn.dataset.tab === name);
     });
+    if (name === "stats" && state.token && !state.statsLoaded) {
+      loadStats();
+    }
   }
 
   async function login() {
@@ -396,6 +415,7 @@
 
   function logout() {
     state.token = "";
+    state.statsLoaded = false;
     localStorage.removeItem("admin_token");
     document.getElementById("targets").innerHTML = "";
     document.getElementById("modelGroups").innerHTML = "";
@@ -403,6 +423,32 @@
     document.getElementById("statsTable").innerHTML = "";
     setLoginStatus("Signed out");
     updateView();
+  }
+
+  function toLocalDatetimeInputValue(date) {
+    const pad = n => String(n).padStart(2, "0");
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  }
+
+  function setDefaultCustomRange() {
+    const end = new Date();
+    const start = new Date(end.getTime() - 24 * 60 * 60 * 1000);
+    document.getElementById("stats_from").value = toLocalDatetimeInputValue(start);
+    document.getElementById("stats_to").value = toLocalDatetimeInputValue(end);
+  }
+
+  function onStatsPresetChange() {
+    const preset = document.getElementById("stats_preset").value;
+    const custom = document.getElementById("stats_custom_range");
+    const isCustom = preset === "custom";
+    custom.style.display = isCustom ? "" : "none";
+    if (isCustom) {
+      const fromInput = document.getElementById("stats_from");
+      const toInput = document.getElementById("stats_to");
+      if (!fromInput.value || !toInput.value) {
+        setDefaultCustomRange();
+      }
+    }
   }
 
   async function refreshAll() {
@@ -677,14 +723,33 @@
 
   async function loadStats() {
     if (!state.token) { setLoginStatus("Please login first"); updateView(); return; }
-    const fromVal = document.getElementById("stats_from").value;
-    const toVal = document.getElementById("stats_to").value;
+    const preset = document.getElementById("stats_preset").value;
     const params = new URLSearchParams();
-    if (fromVal) params.set("from", Math.floor(new Date(fromVal).getTime() / 1000));
-    if (toVal) {
-      const toDate = new Date(toVal);
-      toDate.setHours(23, 59, 59, 999);
-      params.set("to", Math.floor(toDate.getTime() / 1000));
+    if (preset === "custom") {
+      const fromVal = document.getElementById("stats_from").value;
+      const toVal = document.getElementById("stats_to").value;
+      if (!fromVal || !toVal) {
+        setAppStatus("Please provide both custom start and end time.");
+        return;
+      }
+      const fromTs = Math.floor(new Date(fromVal).getTime() / 1000);
+      const toTs = Math.floor(new Date(toVal).getTime() / 1000);
+      if (Number.isNaN(fromTs) || Number.isNaN(toTs)) {
+        setAppStatus("Invalid custom time range.");
+        return;
+      }
+      if (fromTs > toTs) {
+        setAppStatus("Custom range is invalid: start time is after end time.");
+        return;
+      }
+      params.set("from", String(fromTs));
+      params.set("to", String(toTs));
+    } else {
+      const seconds = Number(preset || 86400);
+      const toTs = Math.floor(Date.now() / 1000);
+      const fromTs = toTs - seconds;
+      params.set("from", String(fromTs));
+      params.set("to", String(toTs));
     }
     const url = "/admin/stats" + (params.toString() ? "?" + params.toString() : "");
     const res = await fetch(url, { headers: authHeaders() });
@@ -693,13 +758,15 @@
       setAppStatus(`Load stats failed: ${data?.error?.message || res.status}`);
       return;
     }
+    state.statsLoaded = true;
     renderStats(data.items || []);
   }
 
   function clearStatsFilter() {
-    document.getElementById("stats_from").value = "";
-    document.getElementById("stats_to").value = "";
-    document.getElementById("statsTable").innerHTML = "";
+    document.getElementById("stats_preset").value = "86400";
+    onStatsPresetChange();
+    state.statsLoaded = false;
+    loadStats();
   }
 
   function renderStats(items) {
@@ -794,6 +861,7 @@
 
   (async function boot() {
     updateView();
+    onStatsPresetChange();
     if (!state.token) return;
     await refreshAll();
   })();
