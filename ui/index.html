@@ -428,6 +428,20 @@
     }
     .custom-range.visible { display: flex; }
 
+    /* Token usage bar */
+    .bar-bg {
+      height: 6px;
+      background: var(--bg-2);
+      border-radius: 3px;
+      overflow: hidden;
+    }
+    .bar-fill {
+      height: 100%;
+      background: linear-gradient(90deg, var(--accent), var(--accent-hover));
+      border-radius: 3px;
+      transition: width .4s ease;
+    }
+
     /* Empty state */
     .empty {
       text-align: center;
@@ -1129,17 +1143,29 @@
       root.innerHTML = '<div class="empty" style="padding:24px;">No data for this period.</div>';
       return;
     }
-    const rows = items.map(s => `
+    // Sort by total_tokens descending
+    const sorted = [...items].sort((a, b) => (b.total_tokens || 0) - (a.total_tokens || 0));
+    const maxTokens = Math.max(...sorted.map(s => s.total_tokens || 0), 1);
+
+    const rows = sorted.map((s, idx) => {
+      const pct = ((s.total_tokens || 0) / maxTokens * 100).toFixed(1);
+      return `
       <tr>
-        <td style="color:var(--ink)">${escapeHtml(s.target_name)}</td>
+        <td style="color:var(--ink);font-weight:500">${idx + 1}. ${escapeHtml(s.target_name)}</td>
         <td>${s.total_calls}</td>
         <td style="color:var(--ok)">${s.success_count}</td>
         <td style="color:var(--danger)">${s.error_count}</td>
         <td>${s.prompt_tokens}</td>
         <td>${s.completion_tokens}</td>
-        <td>${s.total_tokens}</td>
+        <td style="font-weight:600">${s.total_tokens}</td>
+        <td style="width:120px">
+          <div class="bar-bg">
+            <div class="bar-fill" style="width:${pct}%"></div>
+          </div>
+        </td>
       </tr>
-    `).join("");
+    `}).join("");
+
     root.innerHTML = `
       <table class="stats-table">
         <thead>
@@ -1151,6 +1177,7 @@
             <th>Prompt</th>
             <th>Completion</th>
             <th>Total</th>
+            <th>Usage</th>
           </tr>
         </thead>
         <tbody>${rows}</tbody>
