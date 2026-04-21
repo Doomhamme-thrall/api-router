@@ -13,6 +13,7 @@ A lightweight OpenAI-compatible LLM router with global round-robin, model-group 
 - Admin API + Web UI (`/ui`) for provider/model target management.
 - File-based config (`config/router.json`) for easy single-host deployment.
 - JWT-protected admin operations.
+- Persistent usage statistics log (JSONL, human-readable) for `/admin/stats`.
 
 ## Quick Start
 
@@ -203,3 +204,16 @@ Download steps:
 - Use a strong random `jwt_secret`.
 - Keep upstream API keys secure and with minimum privileges.
 - Consider restricting `/admin/*` with IP allowlist on Nginx.
+
+## Usage Statistics Persistence
+
+- Usage records are persisted to daily JSONL shards under `data/usage/` by default.
+- File naming pattern: `usage-YYYY-MM-DD.jsonl`.
+- Format is JSON Lines (one JSON object per line), human-readable and easy to inspect/grep.
+- On startup, router loads recent records into memory and continuously appends new records to disk.
+- `/admin/stats` aggregates from persisted shard files, so stats survive process restarts.
+
+Optional env vars:
+
+- `ROUTER_USAGE_LOG`: customize usage log directory (default `data/usage`).
+- `ROUTER_MAX_CALL_RECORDS`: max in-memory cache size (default `100000`); does not limit persisted log file.

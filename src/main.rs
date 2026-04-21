@@ -17,7 +17,7 @@ use axum::{
     routing::{get, post, put},
     Json, Router,
 };
-use chrono::{Duration, Utc};
+use chrono::{Duration, TimeZone, Utc};
 use futures_util::StreamExt;
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use reqwest::Client;
@@ -25,12 +25,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::{fs, sync::RwLock};
+use tokio::io::AsyncWriteExt;
 use tower_http::{cors::CorsLayer, services::ServeDir, trace::TraceLayer};
 use tracing::{error, info};
 
 #[derive(Clone)]
 struct AppState {
     cfg_path: PathBuf,
+    usage_log_dir: PathBuf,
     cfg: Arc<RwLock<RouterConfig>>,
     rr_index: Arc<AtomicUsize>,
     group_rr_index: Arc<RwLock<HashMap<String, usize>>>,
@@ -170,8 +172,17 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(100_000);
 
+    let usage_log_dir = std::env::var("ROUTER_USAGE_LOG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("data/usage"));
+
+    let usage_log_dir = normalize_usage_log_dir(usage_log_dir);
+
+    let existing_records = load_call_records_from_disk(&usage_log_dir, max_call_records).await;
+
     let state = AppState {
         cfg_path,
+        usage_log_dir,
         cfg: Arc::new(RwLock::new(cfg)),
         rr_index: Arc::new(AtomicUsize::new(0)),
         group_rr_index: Arc::new(RwLock::new(HashMap::new())),
@@ -182,7 +193,7 @@ async fn main() -> anyhow::Result<()> {
             .build()
             .context("failed to build reqwest client")?,
         upstream_timeout_secs,
-        call_records: Arc::new(RwLock::new(Vec::new())),
+        call_records: Arc::new(RwLock::new(existing_records)),
         max_call_records,
     };
 
@@ -527,12 +538,226 @@ async fn record_call(
         completion_tokens,
         total_tokens,
     };
-    let mut records = state.call_records.write().await;
-    records.push(record);
-    if records.len() > state.max_call_records {
-        let drain = records.len() - state.max_call_records;
-        records.drain(0..drain);
+    {
+        let mut records = state.call_records.write().await;
+        records.push(record.clone());
+        if records.len() > state.max_call_records {
+            let drain = records.len() - state.max_call_records;
+            records.drain(0..drain);
+        }
     }
+
+    if let Err(err) = append_call_record_to_disk(&state.usage_log_dir, &record).await {
+        error!("failed to append usage record to disk: {}", err);
+    }
+}
+
+fn normalize_usage_log_dir(input: PathBuf) -> PathBuf {
+    if input
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
+    {
+        return input
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("data"));
+    }
+
+    input
+}
+
+fn day_key_from_timestamp(ts: i64) -> String {
+    Utc.timestamp_opt(ts, 0)
+        .single()
+        .map(|dt| dt.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| "1970-01-01".to_string())
+}
+
+fn usage_log_file_for_day(dir: &Path, day_key: &str) -> PathBuf {
+    dir.join(format!("usage-{}.jsonl", day_key))
+}
+
+fn usage_log_file_for_timestamp(dir: &Path, ts: i64) -> PathBuf {
+    usage_log_file_for_day(dir, &day_key_from_timestamp(ts))
+}
+
+async fn list_all_usage_log_files(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let mut items = Vec::new();
+    let mut rd = match fs::read_dir(dir).await {
+        Ok(v) => v,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(items),
+        Err(err) => return Err(err.into()),
+    };
+
+    while let Some(entry) = rd.next_entry().await? {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name.starts_with("usage-") && name.ends_with(".jsonl") {
+            items.push(path);
+        }
+    }
+
+    items.sort();
+    Ok(items)
+}
+
+fn try_day_key(ts: i64) -> Option<String> {
+    Utc.timestamp_opt(ts, 0)
+        .single()
+        .map(|dt| dt.format("%Y-%m-%d").to_string())
+}
+
+fn day_keys_in_range(from: i64, to: i64) -> Option<Vec<String>> {
+    let start = try_day_key(from)?;
+    let end = try_day_key(to)?;
+    let mut day = chrono::NaiveDate::parse_from_str(&start, "%Y-%m-%d").ok()?;
+    let end_day = chrono::NaiveDate::parse_from_str(&end, "%Y-%m-%d").ok()?;
+    if day > end_day {
+        return Some(Vec::new());
+    }
+
+    let mut keys = Vec::new();
+    while day <= end_day {
+        keys.push(day.format("%Y-%m-%d").to_string());
+        day = match day.succ_opt() {
+            Some(v) => v,
+            None => break,
+        };
+    }
+    Some(keys)
+}
+
+async fn usage_log_files_for_range(dir: &Path, from: i64, to: i64) -> anyhow::Result<Vec<PathBuf>> {
+    if from <= 0 || to == i64::MAX {
+        return list_all_usage_log_files(dir).await;
+    }
+
+    let Some(day_keys) = day_keys_in_range(from, to) else {
+        return list_all_usage_log_files(dir).await;
+    };
+    let mut files = Vec::new();
+    for day_key in day_keys {
+        let path = usage_log_file_for_day(dir, &day_key);
+        if fs::metadata(&path).await.is_ok() {
+            files.push(path);
+        }
+    }
+    Ok(files)
+}
+
+async fn append_call_record_to_disk(dir: &Path, record: &CallRecord) -> anyhow::Result<()> {
+    fs::create_dir_all(dir).await?;
+
+    let path = usage_log_file_for_timestamp(dir, record.timestamp);
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .await?;
+    let line = serde_json::to_string(record)?;
+    file.write_all(line.as_bytes()).await?;
+    file.write_all(b"\n").await?;
+    Ok(())
+}
+
+async fn load_call_records_from_disk(dir: &Path, max_records: usize) -> Vec<CallRecord> {
+    let files = match list_all_usage_log_files(dir).await {
+        Ok(v) => v,
+        Err(err) => {
+            error!("failed to list usage logs in {}: {}", dir.display(), err);
+            return Vec::new();
+        }
+    };
+
+    let mut items = Vec::new();
+    for path in files {
+        let body = match fs::read_to_string(&path).await {
+            Ok(v) => v,
+            Err(err) => {
+                error!("failed to read usage log from {}: {}", path.display(), err);
+                continue;
+            }
+        };
+
+        for (idx, line) in body.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<CallRecord>(line) {
+                Ok(record) => items.push(record),
+                Err(err) => error!(
+                    "invalid usage log line {} in {}: {}",
+                    idx + 1,
+                    path.display(),
+                    err
+                ),
+            }
+        }
+    }
+
+    if items.len() > max_records {
+        let drop_count = items.len() - max_records;
+        items.drain(0..drop_count);
+    }
+    items
+}
+
+fn apply_record_to_agg(record: &CallRecord, agg: &mut HashMap<String, TargetStats>) {
+    let entry = agg.entry(record.target_id.clone()).or_insert(TargetStats {
+        target_id: record.target_id.clone(),
+        target_name: record.target_name.clone(),
+        total_calls: 0,
+        success_count: 0,
+        error_count: 0,
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        total_tokens: 0,
+    });
+    entry.total_calls += 1;
+    if record.success {
+        entry.success_count += 1;
+    } else {
+        entry.error_count += 1;
+    }
+    entry.prompt_tokens += record.prompt_tokens;
+    entry.completion_tokens += record.completion_tokens;
+    entry.total_tokens += record.total_tokens;
+}
+
+async fn aggregate_usage_from_disk(
+    dir: &Path,
+    from: i64,
+    to: i64,
+) -> anyhow::Result<HashMap<String, TargetStats>> {
+    let files = usage_log_files_for_range(dir, from, to).await?;
+    let mut agg: HashMap<String, TargetStats> = HashMap::new();
+    for path in files {
+        let body = match fs::read_to_string(&path).await {
+            Ok(v) => v,
+            Err(err) => {
+                error!("failed to read usage log from {}: {}", path.display(), err);
+                continue;
+            }
+        };
+
+        for line in body.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(record) = serde_json::from_str::<CallRecord>(line) {
+                if record.timestamp >= from && record.timestamp <= to {
+                    apply_record_to_agg(&record, &mut agg);
+                }
+            }
+        }
+    }
+    Ok(agg)
 }
 
 fn extract_tokens_from_bytes(bytes: &[u8]) -> (u64, u64, u64) {
@@ -938,33 +1163,25 @@ async fn admin_get_stats(
         return resp;
     }
 
-    let records = state.call_records.read().await;
     let from = query.from.unwrap_or(0);
     let to = query.to.unwrap_or(i64::MAX);
 
-    let mut agg: HashMap<String, TargetStats> = HashMap::new();
-
-    for record in records.iter().filter(|r| r.timestamp >= from && r.timestamp <= to) {
-        let entry = agg.entry(record.target_id.clone()).or_insert(TargetStats {
-            target_id: record.target_id.clone(),
-            target_name: record.target_name.clone(),
-            total_calls: 0,
-            success_count: 0,
-            error_count: 0,
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            total_tokens: 0,
-        });
-        entry.total_calls += 1;
-        if record.success {
-            entry.success_count += 1;
-        } else {
-            entry.error_count += 1;
+    let agg = match aggregate_usage_from_disk(&state.usage_log_dir, from, to).await {
+        Ok(v) => v,
+        Err(err) => {
+            error!(
+                "failed to aggregate usage log from disk ({}), fallback to memory: {}",
+                state.usage_log_dir.display(),
+                err
+            );
+            let records = state.call_records.read().await;
+            let mut in_memory_agg: HashMap<String, TargetStats> = HashMap::new();
+            for record in records.iter().filter(|r| r.timestamp >= from && r.timestamp <= to) {
+                apply_record_to_agg(record, &mut in_memory_agg);
+            }
+            in_memory_agg
         }
-        entry.prompt_tokens += record.prompt_tokens;
-        entry.completion_tokens += record.completion_tokens;
-        entry.total_tokens += record.total_tokens;
-    }
+    };
 
     let mut stats: Vec<TargetStats> = agg.into_values().collect();
     stats.sort_by(|a, b| a.target_name.cmp(&b.target_name));
