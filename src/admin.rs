@@ -47,7 +47,6 @@ pub async fn admin_create_target(
     let new_target = crate::config::UpstreamTarget {
         id: uuid::Uuid::new_v4().to_string(),
         name: req.name,
-        provider: req.provider,
         api_format: normalize_api_format(&req.api_format),
         base_url: req.base_url,
         api_key: req.api_key,
@@ -86,7 +85,6 @@ pub async fn admin_update_target(
         };
 
         target.name = req.name;
-        target.provider = req.provider;
         target.api_format = normalize_api_format(&req.api_format);
         target.base_url = req.base_url;
         target.api_key = req.api_key;

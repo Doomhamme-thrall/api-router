@@ -137,7 +137,7 @@ async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
                 "id": t.router_model,
                 "object": "model",
                 "created": Utc::now().timestamp(),
-                "owned_by": t.provider
+                "owned_by": "llm-router"
             })
         })
         .collect();

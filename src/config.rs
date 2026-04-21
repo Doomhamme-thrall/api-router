@@ -26,7 +26,6 @@ pub struct AdminConfig {
 pub struct UpstreamTarget {
     pub id: String,
     pub name: String,
-    pub provider: String,
     #[serde(default = "default_api_format")]
     pub api_format: String,
     pub base_url: String,
@@ -48,7 +47,6 @@ pub struct ModelGroup {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UpsertTargetRequest {
     pub name: String,
-    pub provider: String,
     #[serde(default = "default_api_format")]
     pub api_format: String,
     pub base_url: String,
