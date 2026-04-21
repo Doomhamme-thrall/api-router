@@ -434,12 +434,58 @@
       background: var(--bg-2);
       border-radius: 3px;
       overflow: hidden;
+      margin-top: 8px;
     }
     .bar-fill {
       height: 100%;
       background: linear-gradient(90deg, var(--accent), var(--accent-hover));
       border-radius: 3px;
       transition: width .4s ease;
+    }
+
+    /* Stats list layout */
+    .stats-list .stats-row:hover { background: transparent; }
+    .stats-item {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 12px 14px;
+      margin-bottom: 8px;
+      transition: border-color .15s;
+    }
+    .stats-item:hover { border-color: var(--border-light); }
+    .stats-main {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+    .stats-rank {
+      font-family: "JetBrains Mono", monospace;
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--accent);
+      min-width: 28px;
+    }
+    .stats-name {
+      font-weight: 600;
+      font-size: 13px;
+      color: var(--ink);
+      flex: 1;
+      min-width: 120px;
+    }
+    .stats-metric {
+      font-family: "JetBrains Mono", monospace;
+      font-size: 11px;
+      color: var(--ink-2);
+    }
+    .stats-metric.ok { color: var(--ok); }
+    .stats-metric.err { color: var(--danger); }
+    .stats-total {
+      font-family: "JetBrains Mono", monospace;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--accent);
     }
 
     /* Empty state */
@@ -1150,36 +1196,29 @@
     const rows = sorted.map((s, idx) => {
       const pct = ((s.total_tokens || 0) / maxTokens * 100).toFixed(1);
       return `
-      <tr>
-        <td style="color:var(--ink);font-weight:500">${idx + 1}. ${escapeHtml(s.target_name)}</td>
-        <td>${s.total_calls}</td>
-        <td style="color:var(--ok)">${s.success_count}</td>
-        <td style="color:var(--danger)">${s.error_count}</td>
-        <td>${s.prompt_tokens}</td>
-        <td>${s.completion_tokens}</td>
-        <td style="font-weight:600">${s.total_tokens}</td>
-        <td style="width:120px">
-          <div class="bar-bg">
-            <div class="bar-fill" style="width:${pct}%"></div>
+      <tr class="stats-row">
+        <td colspan="8" style="padding:0;border:none;">
+          <div class="stats-item">
+            <div class="stats-main">
+              <span class="stats-rank">#${idx + 1}</span>
+              <span class="stats-name">${escapeHtml(s.target_name)}</span>
+              <span class="stats-metric">${s.total_calls} calls</span>
+              <span class="stats-metric ok">${s.success_count} OK</span>
+              <span class="stats-metric err">${s.error_count} Err</span>
+              <span class="stats-metric">${s.prompt_tokens} prompt</span>
+              <span class="stats-metric">${s.completion_tokens} completion</span>
+              <span class="stats-total">${s.total_tokens} tokens</span>
+            </div>
+            <div class="bar-bg">
+              <div class="bar-fill" style="width:${pct}%"></div>
+            </div>
           </div>
         </td>
       </tr>
     `}).join("");
 
     root.innerHTML = `
-      <table class="stats-table">
-        <thead>
-          <tr>
-            <th>Target</th>
-            <th>Calls</th>
-            <th>OK</th>
-            <th>Err</th>
-            <th>Prompt</th>
-            <th>Completion</th>
-            <th>Total</th>
-            <th>Usage</th>
-          </tr>
-        </thead>
+      <table class="stats-table stats-list">
         <tbody>${rows}</tbody>
       </table>
     `;
