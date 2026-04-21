@@ -89,7 +89,7 @@ Requires `Authorization: Bearer <admin_jwt>`.
 - `jwt_secret`
 - `client_api_keys[]`
 - `targets[]`:
-  - `id`, `name`, `provider`, `base_url`, `api_key`
+  - `id`, `name`, `provider`, `api_format`, `base_url`, `api_key`
   - `router_model`, `upstream_model`, `enabled`
 - `model_groups[]`:
   - `id`, `name`, `target_ids[]`, `enabled`
@@ -109,6 +109,35 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 ```
 
 If `team-default` exists and is enabled, request will only route within that group's members.
+
+## Gemini Target Configuration
+
+`targets[]` now supports `api_format`:
+
+- `openai` (default): use OpenAI-compatible upstream format
+- `gemini`: convert OpenAI chat-completions requests to Gemini `generateContent`
+
+Gemini target example:
+
+```json
+{
+  "id": "f0f7e4be-4c77-4ae3-9058-1d9a14cbf7a1",
+  "name": "gemini-flash",
+  "provider": "google",
+  "api_format": "gemini",
+  "base_url": "https://generativelanguage.googleapis.com",
+  "api_key": "AIza...",
+  "router_model": "chat-fast",
+  "upstream_model": "gemini-2.0-flash",
+  "enabled": true
+}
+```
+
+Notes:
+
+- For Gemini targets, `api_key` is sent as URL query parameter `key`.
+- `upstream_model` is used to build `/v1beta/models/{model}:generateContent`.
+- Current Gemini compatibility is for `POST /v1/chat/completions` routing.
 
 ## Ubuntu Deployment
 

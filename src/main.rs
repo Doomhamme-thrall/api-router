@@ -94,6 +94,8 @@ struct UpstreamTarget {
     id: String,
     name: String,
     provider: String,
+    #[serde(default = "default_api_format")]
+    api_format: String,
     base_url: String,
     api_key: String,
     router_model: String,
@@ -133,11 +135,28 @@ struct Claims {
 struct UpsertTargetRequest {
     name: String,
     provider: String,
+    #[serde(default = "default_api_format")]
+    api_format: String,
     base_url: String,
     api_key: String,
     router_model: String,
     upstream_model: String,
     enabled: bool,
+}
+
+fn default_api_format() -> String {
+    "openai".to_string()
+}
+
+fn normalize_api_format(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "gemini" => "gemini".to_string(),
+        _ => "openai".to_string(),
+    }
+}
+
+fn is_gemini_format(value: &str) -> bool {
+    normalize_api_format(value) == "gemini"
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -342,6 +361,106 @@ async fn proxy_openai_request(
     for target in candidates {
         let mut attempt_payload = payload.clone();
         attempt_payload["model"] = Value::String(target.upstream_model.clone());
+
+        if is_gemini_format(&target.api_format) {
+            if route != "chat/completions" {
+                last_err_message = "gemini target only supports chat/completions".to_string();
+                error!("{}", last_err_message);
+                record_call(&state, &target, false, 0, 0, 0).await;
+                continue;
+            }
+
+            let gemini_payload = match build_gemini_request_payload(&attempt_payload) {
+                Ok(v) => v,
+                Err(err) => {
+                    last_err_message = err;
+                    error!("{}", last_err_message);
+                    record_call(&state, &target, false, 0, 0, 0).await;
+                    continue;
+                }
+            };
+
+            let upstream_url = build_gemini_upstream_url(&target.base_url, &target.upstream_model);
+            let req = state
+                .http_client
+                .post(upstream_url)
+                .header("Content-Type", "application/json")
+                .timeout(std::time::Duration::from_secs(state.upstream_timeout_secs))
+                .query(&[("key", target.api_key.as_str())])
+                .json(&gemini_payload);
+
+            let upstream_resp = match req.send().await {
+                Ok(resp) => resp,
+                Err(err) => {
+                    last_err_message = format!("upstream request failed: {}", err);
+                    error!("{}", last_err_message);
+                    record_call(&state, &target, false, 0, 0, 0).await;
+                    continue;
+                }
+            };
+
+            let status = upstream_resp.status();
+            if status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS {
+                last_err_message = format!("upstream status {}", status);
+                error!("{}", last_err_message);
+                record_call(&state, &target, false, 0, 0, 0).await;
+                continue;
+            }
+
+            let body_bytes = match upstream_resp.bytes().await {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    last_err_message = format!("failed to read response body: {}", err);
+                    error!("{}", last_err_message);
+                    record_call(&state, &target, false, 0, 0, 0).await;
+                    continue;
+                }
+            };
+
+            if !status.is_success() {
+                let mut response = Response::new(Body::from(body_bytes));
+                *response.status_mut() = status;
+                response.headers_mut().insert(
+                    "content-type",
+                    HeaderValue::from_static("application/json"),
+                );
+                return response;
+            }
+
+            let gemini_body: Value = match serde_json::from_slice(&body_bytes) {
+                Ok(v) => v,
+                Err(err) => {
+                    last_err_message = format!("invalid gemini response json: {}", err);
+                    error!("{}", last_err_message);
+                    record_call(&state, &target, false, 0, 0, 0).await;
+                    continue;
+                }
+            };
+
+            let openai_like = gemini_to_openai_chat_completion(&gemini_body, &target.upstream_model);
+            let (pt, ct, tt) = extract_tokens_from_value(&openai_like);
+
+            if !is_streaming {
+                record_call(&state, &target, true, pt, ct, tt).await;
+                let mut response = Response::new(Body::from(openai_like.to_string()));
+                *response.status_mut() = status;
+                response.headers_mut().insert(
+                    "content-type",
+                    HeaderValue::from_static("application/json"),
+                );
+                return response;
+            }
+
+            let sse_body = build_openai_sse_from_completion(&openai_like);
+            record_call(&state, &target, true, pt, ct, tt).await;
+            let mut response = Response::new(Body::from(sse_body));
+            *response.status_mut() = status;
+            response.headers_mut().insert(
+                "content-type",
+                HeaderValue::from_static("text/event-stream"),
+            );
+            return response;
+        }
 
         let upstream_url = build_upstream_url(&target.base_url, route);
         let req = state
@@ -772,6 +891,230 @@ fn extract_tokens_from_bytes(bytes: &[u8]) -> (u64, u64, u64) {
     (0, 0, 0)
 }
 
+fn extract_tokens_from_value(v: &Value) -> (u64, u64, u64) {
+    let usage = v.get("usage").and_then(|v| v.as_object());
+    let prompt = usage
+        .and_then(|u| u.get("prompt_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let completion = usage
+        .and_then(|u| u.get("completion_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let total = usage
+        .and_then(|u| u.get("total_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    (prompt, completion, total)
+}
+
+fn message_content_to_text(content: &Value) -> String {
+    if let Some(s) = content.as_str() {
+        return s.to_string();
+    }
+    if let Some(items) = content.as_array() {
+        let mut texts = Vec::new();
+        for item in items {
+            if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                texts.push(text.to_string());
+            }
+        }
+        return texts.join("\n");
+    }
+    String::new()
+}
+
+fn build_gemini_request_payload(openai_payload: &Value) -> Result<Value, String> {
+    let Some(messages) = openai_payload.get("messages").and_then(|v| v.as_array()) else {
+        return Err("gemini target requires openai messages[]".to_string());
+    };
+
+    let mut system_parts = Vec::new();
+    let mut contents = Vec::new();
+    for msg in messages {
+        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+        let text = msg
+            .get("content")
+            .map(message_content_to_text)
+            .unwrap_or_default();
+        if text.trim().is_empty() {
+            continue;
+        }
+
+        if role == "system" {
+            system_parts.push(json!({"text": text}));
+            continue;
+        }
+
+        let gemini_role = if role == "assistant" { "model" } else { "user" };
+        contents.push(json!({
+            "role": gemini_role,
+            "parts": [{"text": text}]
+        }));
+    }
+
+    if contents.is_empty() {
+        return Err("gemini target requires at least one non-system message".to_string());
+    }
+
+    let mut out = json!({"contents": contents});
+
+    let mut generation_config = serde_json::Map::new();
+    if let Some(v) = openai_payload.get("temperature") {
+        generation_config.insert("temperature".to_string(), v.clone());
+    }
+    if let Some(v) = openai_payload.get("top_p") {
+        generation_config.insert("topP".to_string(), v.clone());
+    }
+    if let Some(v) = openai_payload.get("max_tokens") {
+        generation_config.insert("maxOutputTokens".to_string(), v.clone());
+    }
+    if let Some(v) = openai_payload.get("stop") {
+        generation_config.insert("stopSequences".to_string(), v.clone());
+    }
+
+    if !generation_config.is_empty() {
+        out["generationConfig"] = Value::Object(generation_config);
+    }
+
+    if !system_parts.is_empty() {
+        out["systemInstruction"] = json!({"parts": system_parts});
+    }
+
+    Ok(out)
+}
+
+fn build_gemini_upstream_url(base_url: &str, model: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    if base.contains(":generateContent") {
+        return base.to_string();
+    }
+    if base.contains("/models/") {
+        if base.contains(':') {
+            return base.to_string();
+        }
+        return format!("{}:generateContent", base);
+    }
+    format!("{}/v1beta/models/{}:generateContent", base, model)
+}
+
+fn map_gemini_finish_reason(reason: &str) -> &str {
+    match reason {
+        "STOP" => "stop",
+        "MAX_TOKENS" => "length",
+        "SAFETY" => "content_filter",
+        "RECITATION" => "content_filter",
+        _ => "stop",
+    }
+}
+
+fn gemini_to_openai_chat_completion(gemini_body: &Value, model: &str) -> Value {
+    let text = gemini_body
+        .get("candidates")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|cand| cand.get("content"))
+        .and_then(|content| content.get("parts"))
+        .and_then(|v| v.as_array())
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|p| p.get("text").and_then(|v| v.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+
+    let finish_reason = gemini_body
+        .get("candidates")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|cand| cand.get("finishReason"))
+        .and_then(|v| v.as_str())
+        .map(map_gemini_finish_reason)
+        .unwrap_or("stop");
+
+    let prompt_tokens = gemini_body
+        .get("usageMetadata")
+        .and_then(|u| u.get("promptTokenCount"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let completion_tokens = gemini_body
+        .get("usageMetadata")
+        .and_then(|u| u.get("candidatesTokenCount"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let total_tokens = gemini_body
+        .get("usageMetadata")
+        .and_then(|u| u.get("totalTokenCount"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(prompt_tokens + completion_tokens);
+
+    json!({
+        "id": format!("chatcmpl-gemini-{}", Utc::now().timestamp_millis()),
+        "object": "chat.completion",
+        "created": Utc::now().timestamp(),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": text
+            },
+            "finish_reason": finish_reason
+        }],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens
+        }
+    })
+}
+
+fn build_openai_sse_from_completion(completion: &Value) -> String {
+    let id = completion
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("chatcmpl-gemini");
+    let created = completion
+        .get("created")
+        .and_then(|v| v.as_i64())
+        .unwrap_or_else(|| Utc::now().timestamp());
+    let model = completion
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("gemini");
+    let text = completion
+        .get("choices")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    let first = json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": Value::Null}]
+    });
+    let second = json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": "stop"}]
+    });
+
+    format!(
+        "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+        first,
+        second
+    )
+}
+
 fn api_error(status: StatusCode, message: &str) -> Response {
     let body = Json(json!({
         "error": {
@@ -858,6 +1201,7 @@ async fn admin_create_target(
         id: uuid::Uuid::new_v4().to_string(),
         name: req.name,
         provider: req.provider,
+        api_format: normalize_api_format(&req.api_format),
         base_url: req.base_url,
         api_key: req.api_key,
         router_model: req.router_model,
@@ -896,6 +1240,7 @@ async fn admin_update_target(
 
         target.name = req.name;
         target.provider = req.provider;
+        target.api_format = normalize_api_format(&req.api_format);
         target.base_url = req.base_url;
         target.api_key = req.api_key;
         target.router_model = req.router_model;
@@ -1117,16 +1462,35 @@ async fn admin_test_target(
         "stream": false
     });
 
-    let upstream_url = build_upstream_url(&target.base_url, "chat/completions");
-    let result = state
-        .http_client
-        .post(&upstream_url)
-        .header("Authorization", format!("Bearer {}", target.api_key))
-        .header("Content-Type", "application/json")
-        .timeout(std::time::Duration::from_secs(30))
-        .json(&payload)
-        .send()
-        .await;
+    let result = if is_gemini_format(&target.api_format) {
+        let gemini_payload = match build_gemini_request_payload(&payload) {
+            Ok(v) => v,
+            Err(err) => {
+                return Json(json!({"ok": false, "error": err})).into_response();
+            }
+        };
+        let upstream_url = build_gemini_upstream_url(&target.base_url, &target.upstream_model);
+        state
+            .http_client
+            .post(&upstream_url)
+            .header("Content-Type", "application/json")
+            .timeout(std::time::Duration::from_secs(30))
+            .query(&[("key", target.api_key.as_str())])
+            .json(&gemini_payload)
+            .send()
+            .await
+    } else {
+        let upstream_url = build_upstream_url(&target.base_url, "chat/completions");
+        state
+            .http_client
+            .post(&upstream_url)
+            .header("Authorization", format!("Bearer {}", target.api_key))
+            .header("Content-Type", "application/json")
+            .timeout(std::time::Duration::from_secs(30))
+            .json(&payload)
+            .send()
+            .await
+    };
 
     match result {
         Err(err) => Json(json!({
