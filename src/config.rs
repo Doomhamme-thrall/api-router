@@ -120,6 +120,11 @@ pub fn build_upstream_url(base_url: &str, route: &str) -> String {
         return base.to_string();
     }
 
+    // If base already ends with /v1, don't add another /v1
+    if base.ends_with("/v1") || base.ends_with("/v1/") {
+        return format!("{}/{}", base, route);
+    }
+
     if base.ends_with("/api/v3") {
         return format!("{}/{}", base, route);
     }

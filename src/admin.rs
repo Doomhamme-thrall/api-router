@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::error::Error;
 
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -290,7 +291,7 @@ pub async fn admin_test_target(
             .http_client
             .post(&upstream_url)
             .header("Content-Type", "application/json")
-            .timeout(std::time::Duration::from_secs(30))
+            .timeout(std::time::Duration::from_secs(state.upstream_timeout_secs))
             .query(&[("key", target.api_key.as_str())])
             .json(&gemini_payload)
             .send()
@@ -302,31 +303,62 @@ pub async fn admin_test_target(
             .post(&upstream_url)
             .header("Authorization", format!("Bearer {}", target.api_key))
             .header("Content-Type", "application/json")
-            .timeout(std::time::Duration::from_secs(30))
+            .timeout(std::time::Duration::from_secs(state.upstream_timeout_secs))
             .json(&payload)
             .send()
             .await
     };
 
     match result {
-        Err(err) => Json(json!({
-            "ok": false,
-            "error": format!("request failed: {}", err)
-        }))
-        .into_response(),
+        Err(err) => {
+            let err_msg = if let Some(source) = err.source() {
+                format!("request failed: {} (source: {})", err, source)
+            } else {
+                format!("request failed: {}", err)
+            };
+            error!("Test target {} failed: {}", target.name, err_msg);
+            Json(json!({
+                "ok": false,
+                "error": err_msg
+            }))
+            .into_response()
+        }
         Ok(resp) => {
             let status = resp.status();
-            match resp.json::<Value>().await {
+            // Read raw bytes first for better error diagnostics
+            match resp.bytes().await {
                 Err(err) => Json(json!({
                     "ok": false,
-                    "error": format!("failed to read response: {}", err)
+                    "error": format!("failed to read response body: {}", err)
                 }))
                 .into_response(),
-                Ok(body) => {
-                    if status.is_success() {
-                        Json(json!({"ok": true, "response": body})).into_response()
-                    } else {
-                        Json(json!({"ok": false, "error": body})).into_response()
+                Ok(bytes) => {
+                    // Try to parse as JSON
+                    match serde_json::from_slice::<Value>(&bytes) {
+                        Ok(body) => {
+                            if status.is_success() {
+                                Json(json!({"ok": true, "response": body})).into_response()
+                            } else {
+                                Json(json!({"ok": false, "error": body})).into_response()
+                            }
+                        }
+                        Err(parse_err) => {
+                            // Log the raw response for debugging
+                            let raw_text = String::from_utf8_lossy(&bytes);
+                            error!(
+                                "JSON parse error for target {}: {}. Raw response (first 500 chars): {}",
+                                target.name,
+                                parse_err,
+                                &raw_text.chars().take(500).collect::<String>()
+                            );
+                            Json(json!({
+                                "ok": false,
+                                "error": format!("JSON parse error: {}. Raw response preview: {}", 
+                                    parse_err,
+                                    &raw_text.chars().take(200).collect::<String>())
+                            }))
+                            .into_response()
+                        }
                     }
                 }
             }
