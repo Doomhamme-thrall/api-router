@@ -429,17 +429,22 @@
     .custom-range.visible { display: flex; }
 
     /* Token usage bar */
+    .bar-stack {
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+      margin-top: 10px;
+    }
     .bar-bg {
-      height: 6px;
+      height: 8px;
       background: var(--bg-2);
-      border-radius: 3px;
+      border-radius: 4px;
       overflow: hidden;
-      margin-top: 8px;
     }
     .bar-fill {
       height: 100%;
       background: linear-gradient(90deg, var(--accent), var(--accent-hover));
-      border-radius: 3px;
+      border-radius: 4px;
       transition: width .4s ease;
     }
 
@@ -1191,10 +1196,23 @@
     }
     // Sort by total_tokens descending
     const sorted = [...items].sort((a, b) => (b.total_tokens || 0) - (a.total_tokens || 0));
-    const maxTokens = Math.max(...sorted.map(s => s.total_tokens || 0), 1);
+    const TOKENS_PER_ROW = 1000000;
 
     const rows = sorted.map((s, idx) => {
-      const pct = ((s.total_tokens || 0) / maxTokens * 100).toFixed(1);
+      const total = s.total_tokens || 0;
+      const fullRows = Math.floor(total / TOKENS_PER_ROW);
+      const remainder = total % TOKENS_PER_ROW;
+      const remainderPct = (remainder / TOKENS_PER_ROW * 100).toFixed(1);
+
+      // Build bar rows: full rows + partial row (if any)
+      let barHtml = '';
+      for (let i = 0; i < fullRows; i++) {
+        barHtml += `<div class="bar-bg"><div class="bar-fill" style="width:100%"></div></div>`;
+      }
+      if (remainder > 0 || total === 0) {
+        barHtml += `<div class="bar-bg"><div class="bar-fill" style="width:${remainderPct}%"></div></div>`;
+      }
+
       return `
       <tr class="stats-row">
         <td colspan="8" style="padding:0;border:none;">
@@ -1209,9 +1227,7 @@
               <span class="stats-metric">${s.completion_tokens} completion</span>
               <span class="stats-total">${s.total_tokens} tokens</span>
             </div>
-            <div class="bar-bg">
-              <div class="bar-fill" style="width:${pct}%"></div>
-            </div>
+            <div class="bar-stack">${barHtml}</div>
           </div>
         </td>
       </tr>
