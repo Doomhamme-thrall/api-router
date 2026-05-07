@@ -45,7 +45,7 @@ Server starts at `0.0.0.0:8080` by default.
 
 ## One-Click Deployment (Ubuntu/Debian)
 
-一键部署到服务器，自动注册 systemd 服务 + Nginx 反向代理：
+一键部署到服务器，自动注册 systemd 服务：
 
 ```bash
 sudo bash deploy/deploy-ubuntu.sh

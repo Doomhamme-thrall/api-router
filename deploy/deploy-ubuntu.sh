@@ -21,10 +21,8 @@ err()   { echo -e "${RED}[ERR]${NC} $*" >&2; }
 # ---------- 配置 ----------
 INSTALL_DIR="${INSTALL_DIR:-/opt/llm-router}"
 BIND_ADDR="${BIND_ADDR:-127.0.0.1:8080}"
-NGINX_SITE="${NGINX_SITE:-llm-router}"
 # 默认跳过编译（使用 release/ 预编译二进制）
 SKIP_BUILD="${SKIP_BUILD:-1}"
-SKIP_NGINX="${SKIP_NGINX:-0}"
 
 # ---------- 检查 root ----------
 if [[ $EUID -ne 0 ]]; then
@@ -194,46 +192,7 @@ systemctl restart llm-router
 ok "systemd 服务安装并启动 ✓"
 
 # ================================================================
-# 5. 配置 Nginx（可选）
-# ================================================================
-if [[ "${SKIP_NGINX}" != "1" ]] && command -v nginx &>/dev/null; then
-  info "配置 Nginx..."
-
-  cat > /etc/nginx/sites-available/${NGINX_SITE} <<NGINX
-server {
-    listen 80;
-    server_name _;
-
-    location / {
-        proxy_pass http://${BIND_ADDR};
-        proxy_http_version 1.1;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_read_timeout 3600;
-        proxy_send_timeout 3600;
-    }
-}
-NGINX
-
-  if [[ -f "/etc/nginx/sites-enabled/default" ]]; then
-    rm -f /etc/nginx/sites-enabled/default
-  fi
-  ln -sf "/etc/nginx/sites-available/${NGINX_SITE}" "/etc/nginx/sites-enabled/${NGINX_SITE}"
-
-  if nginx -t 2>/dev/null; then
-    systemctl reload nginx || systemctl restart nginx
-    ok "Nginx 配置完成 ✓"
-  else
-    warn "Nginx 配置测试失败，请手动检查: nginx -t"
-  fi
-else
-  info "跳过 Nginx 配置 (SKIP_NGINX=1 或 Nginx 未安装)"
-fi
-
-# ================================================================
-# 6. 完成
+# 5. 完成
 # ================================================================
 echo ""
 echo "═══════════════════════════════════════════════════════════"
