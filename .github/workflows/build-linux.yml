@@ -2,10 +2,14 @@ name: Build Linux Binary
 
 on:
   push:
+    branches:
+      - main
+    tags:
+      - 'v*'
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build-linux:
@@ -24,8 +28,34 @@ jobs:
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
 
+      - name: Setup Node.js (for UI build)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Build frontend
+        run: |
+          cd ui
+          npm ci
+          npm run build
+
       - name: Build release binary
         run: cargo build --release --locked --target x86_64-unknown-linux-gnu
+
+      - name: Prepare release package
+        run: |
+          mkdir -p release/llm-router-${{ github.ref_name }}/config
+          mkdir -p release/llm-router-${{ github.ref_name }}/data/usage
+          cp target/x86_64-unknown-linux-gnu/release/llm-router release/llm-router-${{ github.ref_name }}/
+          cp -r ui/dist release/llm-router-${{ github.ref_name }}/ui
+          cp config/router.json release/llm-router-${{ github.ref_name }}/config/router.json 2>/dev/null || true
+          cp deploy/llm-router.service release/llm-router-${{ github.ref_name }}/ 2>/dev/null || true
+          cp deploy/nginx.conf release/llm-router-${{ github.ref_name }}/ 2>/dev/null || true
+          cp deploy/deploy-ubuntu.sh release/llm-router-${{ github.ref_name }}/ 2>/dev/null || true
+          tar czf llm-router-linux-x86_64.tar.gz -C release llm-router-${{ github.ref_name }}
+          ls -lh llm-router-linux-x86_64.tar.gz
 
       - name: Upload Linux binary artifact
         uses: actions/upload-artifact@v4
@@ -33,3 +63,48 @@ jobs:
           name: llm-router-linux-x86_64-${{ github.sha }}
           path: target/x86_64-unknown-linux-gnu/release/llm-router
           if-no-files-found: error
+
+      - name: Upload full release package
+        uses: actions/upload-artifact@v4
+        with:
+          name: llm-router-full-x86_64-${{ github.sha }}
+          path: llm-router-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+      - name: Create Release and upload assets
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: llm-router ${{ github.ref_name }}
+          body: |
+            ## llm-router ${{ github.ref_name }}
+
+            ### 包含内容
+            - `llm-router` — Linux x86_64 可执行文件
+            - `ui/` — 前端管理界面
+            - `deploy/` — 部署辅助脚本和配置
+            - `config/router.json` — 配置文件（需要编辑 API keys）
+
+            ### 使用方式
+
+            ```bash
+            # 下载并解压
+            tar xzf llm-router-linux-x86_64.tar.gz
+            cd llm-router-${{ github.ref_name }}
+
+            # 编辑配置文件
+            vim config/router.json
+
+            # 运行
+            ./llm-router
+            ```
+
+            ### 一键部署
+
+            ```bash
+            sudo bash deploy-ubuntu.sh
+            ```
+          files: |
+            llm-router-linux-x86_64.tar.gz
+          draft: false
+          prerelease: false

@@ -1,22 +1,41 @@
-# Rust build artifacts
+# ── Rust build artifacts ──
 target/
 target_*/
 
-# Environment files
+# ── Node.js / frontend ──
+node_modules/
+ui/dist/
+*.tsbuildinfo
+ui/build-errors.txt
+ui/build-log.txt
+ui/.env.local
+
+# ── Environment files ──
 .env
 .env.*
+!.env.example
 
-# Logs
+# ── Logs ──
 *.log
+data/usage/
 
-# Local runtime/config secrets
+# ── Local runtime/config secrets ──
 config/router.json
 
-# Python artifacts (for helper scripts)
+# ── Python artifacts (for helper scripts) ──
 __pycache__/
 *.pyc
+*.egg-info/
 
-# Editor/OS artifacts
+# ── Editor / IDE ──
 .vscode/
+.idea/
+*.swp
+*.swo
+*~
 .DS_Store
 Thumbs.db
+
+# ── OS metadata ──
+Desktop.ini
+ehthumbs.db

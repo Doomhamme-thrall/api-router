@@ -5,8 +5,10 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
 use anyhow::Context;
+use axum::body::Body;
 use axum::extract::State;
-use axum::response::{IntoResponse, Redirect};
+use axum::http::StatusCode;
+use axum::response::{Html, IntoResponse, Redirect};
 use axum::routing::{get, post, put};
 use axum::Json;
 use axum::Router;
@@ -15,7 +17,6 @@ use reqwest::Client;
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 use tower_http::cors::CorsLayer;
-use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
@@ -102,7 +103,8 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/admin/test-target/:id", get(admin::admin_test_target))
         .route("/admin/stats", get(admin::admin_get_stats))
-        .nest_service("/ui", ServeDir::new("ui"))
+        .route("/ui", get(ui_index))
+        .route("/ui/*path", get(ui_handler))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -124,6 +126,54 @@ async fn healthz() -> impl IntoResponse {
 
 async fn root_redirect() -> Redirect {
     Redirect::temporary("/ui")
+}
+
+/// Serve the SPA index page (for `/ui`)
+async fn ui_index() -> impl IntoResponse {
+    ui_serve_index().await
+}
+
+/// Serve static files under `/ui/*path` with SPA fallback
+async fn ui_handler(axum::extract::Path(path): axum::extract::Path<String>) -> impl IntoResponse {
+    let base = std::path::Path::new("ui/dist");
+    let clean_path = path.trim_start_matches('/');
+
+    if !clean_path.is_empty() {
+        let file_path = base.join(clean_path);
+        if file_path.is_file() {
+            let ext = file_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("");
+            let mime = match ext {
+                "js" => "application/javascript",
+                "css" => "text/css",
+                "html" => "text/html",
+                "svg" => "image/svg+xml",
+                "png" => "image/png",
+                "ico" => "image/x-icon",
+                "json" | "map" => "application/json",
+                "woff2" => "font/woff2",
+                _ => "application/octet-stream",
+            };
+            if let Ok(data) = tokio::fs::read(&file_path).await {
+                return axum::response::Response::builder()
+                    .header("content-type", mime)
+                    .body(Body::from(data))
+                    .unwrap();
+            }
+        }
+    }
+
+    // SPA fallback: always serve index.html
+    ui_serve_index().await
+}
+
+async fn ui_serve_index() -> axum::response::Response {
+    match tokio::fs::read_to_string("ui/dist/index.html").await {
+        Ok(html) => Html(html).into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "Not found").into_response(),
+    }
 }
 
 async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
