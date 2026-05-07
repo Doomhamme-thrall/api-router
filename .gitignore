@@ -10,6 +10,9 @@ ui/build-errors.txt
 ui/build-log.txt
 ui/.env.local
 
+# ── Pre-built binary (CI auto-commits with -f) ──
+/release/
+
 # ── Environment files ──
 .env
 .env.*

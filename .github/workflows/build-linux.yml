@@ -19,6 +19,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # 需要完整历史用于推送
+          fetch-depth: 0
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -44,27 +47,59 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked --target x86_64-unknown-linux-gnu
 
-      - name: Prepare release package
-        run: |
-          mkdir -p release/llm-router-${{ github.ref_name }}/config
-          mkdir -p release/llm-router-${{ github.ref_name }}/data/usage
-          cp target/x86_64-unknown-linux-gnu/release/llm-router release/llm-router-${{ github.ref_name }}/
-          cp -r ui/dist release/llm-router-${{ github.ref_name }}/ui
-          cp config/router.json release/llm-router-${{ github.ref_name }}/config/router.json 2>/dev/null || true
-          cp deploy/llm-router.service release/llm-router-${{ github.ref_name }}/ 2>/dev/null || true
-          cp deploy/nginx.conf release/llm-router-${{ github.ref_name }}/ 2>/dev/null || true
-          cp deploy/deploy-ubuntu.sh release/llm-router-${{ github.ref_name }}/ 2>/dev/null || true
-          tar czf llm-router-linux-x86_64.tar.gz -C release llm-router-${{ github.ref_name }}
-          ls -lh llm-router-linux-x86_64.tar.gz
+      - name: Strip debug symbols (smaller binary)
+        run: strip target/x86_64-unknown-linux-gnu/release/llm-router
 
-      - name: Upload Linux binary artifact
+      - name: Stage pre-built binary and UI
+        run: |
+          mkdir -p release
+          cp target/x86_64-unknown-linux-gnu/release/llm-router release/llm-router
+          chmod +x release/llm-router
+          rm -rf release/ui
+          cp -r ui/dist release/ui
+
+      - name: Upload binary artifact (for Actions debug)
         uses: actions/upload-artifact@v4
         with:
           name: llm-router-linux-x86_64-${{ github.sha }}
-          path: target/x86_64-unknown-linux-gnu/release/llm-router
+          path: release/llm-router
           if-no-files-found: error
 
-      - name: Upload full release package
+      # ── 提交二进制到 main 分支 ──
+      - name: Commit pre-built binary to main branch
+        if: github.ref == 'refs/heads/main'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # release/ 在 .gitignore 中，需要用 -f 强制添加
+          git add -f release/
+
+          if git diff --cached --quiet; then
+            echo "二进制无变化，跳过提交"
+          else
+            git commit -m "chore: update pre-built binary and UI [skip ci]"
+            git push
+            echo "已提交预编译二进制到 main 分支"
+          fi
+
+      # ── 打标签时发布 Release ──
+      - name: Package release tarball
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          mkdir -p _release/llm-router-${{ github.ref_name }}/config
+          mkdir -p _release/llm-router-${{ github.ref_name }}/data/usage
+          cp release/llm-router _release/llm-router-${{ github.ref_name }}/
+          cp -r release/ui _release/llm-router-${{ github.ref_name }}/ui
+          cp config/router.json _release/llm-router-${{ github.ref_name }}/config/router.json 2>/dev/null || true
+          cp deploy/llm-router.service _release/llm-router-${{ github.ref_name }}/ 2>/dev/null || true
+          cp deploy/nginx.conf _release/llm-router-${{ github.ref_name }}/ 2>/dev/null || true
+          cp deploy/deploy-ubuntu.sh _release/llm-router-${{ github.ref_name }}/ 2>/dev/null || true
+          tar czf llm-router-linux-x86_64.tar.gz -C _release llm-router-${{ github.ref_name }}
+          ls -lh llm-router-linux-x86_64.tar.gz
+
+      - name: Upload release tarball artifact
+        if: startsWith(github.ref, 'refs/tags/')
         uses: actions/upload-artifact@v4
         with:
           name: llm-router-full-x86_64-${{ github.sha }}
@@ -79,31 +114,23 @@ jobs:
           body: |
             ## llm-router ${{ github.ref_name }}
 
-            ### 包含内容
-            - `llm-router` — Linux x86_64 可执行文件
-            - `ui/` — 前端管理界面
-            - `deploy/` — 部署辅助脚本和配置
-            - `config/router.json` — 配置文件（需要编辑 API keys）
+            预编译二进制已自动提交到 main 分支的 `release/` 目录。
 
-            ### 使用方式
-
+            ### 快速使用（克隆即运行）
             ```bash
-            # 下载并解压
-            tar xzf llm-router-linux-x86_64.tar.gz
-            cd llm-router-${{ github.ref_name }}
+            git clone https://github.com/${{ github.repository }}
+            cd llm-router
 
-            # 编辑配置文件
+            # 编辑配置
             vim config/router.json
 
-            # 运行
-            ./llm-router
+            # 直接运行（无需 Rust 编译）
+            ./release/llm-router
             ```
 
-            ### 一键部署
-
-            ```bash
-            sudo bash deploy-ubuntu.sh
-            ```
+            ### 下载 Release 包
+            此 Release 提供完整打包（binary + UI + 部署脚本 + 配置），
+            解压即可部署到服务器。
           files: |
             llm-router-linux-x86_64.tar.gz
           draft: false
