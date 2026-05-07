@@ -17,18 +17,57 @@ A lightweight OpenAI-compatible LLM router with global round-robin, model-group 
 
 ## Quick Start
 
-1. Install Rust toolchain.
-2. Edit `config/router.json`:
-   - set `jwt_secret`
-   - update admin password hash if needed
-   - add valid upstream API keys and enable targets
-3. Run:
+无需安装 Rust 或 Node.js，直接使用 CI 自动编译的二进制即可运行。
 
 ```bash
-cargo run
+# 1. 克隆仓库
+git clone https://github.com/Doomhamme-thrall/api-router
+cd llm-router
+
+# 2. 编辑配置文件（填上你的 API keys）
+vim config/router.json
+
+# 3. 直接运行（使用预编译二进制，无需编译）
+./release/llm-router
+```
+
+CI 每次推送到 `main` 分支时自动编译并将二进制提交到 `release/` 目录，
+所以你 clone 的仓库里就已经有可直接运行的二进制了。
+
+### 从源码编译（开发者）
+
+```bash
+cargo build --release
+./target/release/llm-router
 ```
 
 Server starts at `0.0.0.0:8080` by default.
+
+## One-Click Deployment (Ubuntu/Debian)
+
+一键部署到服务器，自动注册 systemd 服务 + Nginx 反向代理：
+
+```bash
+sudo bash deploy/deploy-ubuntu.sh
+```
+
+脚本默认使用 `release/` 下的预编译二进制，无需安装 Rust/Node.js。
+如需从源码编译：
+
+```bash
+SKIP_BUILD=0 sudo bash deploy/deploy-ubuntu.sh
+```
+
+## One-Click Deployment (Windows)
+
+以管理员身份运行 PowerShell：
+
+```powershell
+.\deploy\deploy-windows.ps1
+```
+
+脚本使用 NSSM 注册为 Windows 系统服务。
+加 `-SkipBuild:$false` 从源码编译（需要 Rust + Node.js）。
 
 ## OpenAI-Compatible Call Example
 
@@ -139,93 +178,17 @@ Notes:
 - `upstream_model` is used to build `/v1beta/models/{model}:generateContent`.
 - Current Gemini compatibility is for `POST /v1/chat/completions` routing.
 
-## Ubuntu Deployment
+## CI Auto Build
 
-1. Build release binary:
+Repository includes workflow: `.github/workflows/build-linux.yml`
 
-```bash
-cargo build --release
-```
+| 触发方式 | 行为 |
+|---|---|
+| 推送到 `main` 分支 | 自动编译 Linux x86_64 binary + 前端 UI，**提交到仓库 `release/` 目录** |
+| 推送标签 `v*` | 在上述基础上，额外发布 GitHub Release 完整包 |
+| 手动触发 (`workflow_dispatch`) | 同上 |
 
-2. Copy files to server:
-
-- binary -> `/opt/llm-router/llm-router`
-- `config/router.json` -> `/opt/llm-router/config/router.json`
-- `ui/` -> `/opt/llm-router/ui/`
-
-3. Install systemd service:
-
-```bash
-sudo cp deploy/llm-router.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now llm-router
-```
-
-4. Install nginx config:
-
-```bash
-sudo cp deploy/nginx.conf /etc/nginx/sites-available/llm-router
-sudo ln -s /etc/nginx/sites-available/llm-router /etc/nginx/sites-enabled/llm-router
-sudo nginx -t && sudo systemctl reload nginx
-```
-
-## Ubuntu Run Script
-
-Project includes a helper script:
-
-- [deploy/start-router-ubuntu.sh](deploy/start-router-ubuntu.sh)
-
-Make it executable:
-
-```bash
-chmod +x deploy/start-router-ubuntu.sh
-```
-
-Run with defaults:
-
-```bash
-./deploy/start-router-ubuntu.sh
-```
-
-Common options via environment variables:
-
-```bash
-# Bind to all interfaces
-BIND_ADDR=0.0.0.0:8080 ./deploy/start-router-ubuntu.sh
-
-# Use binary mode (no cargo required)
-MODE=binary BINARY_PATH=./llm-router ./deploy/start-router-ubuntu.sh
-
-# Skip cargo check
-SKIP_BUILD=1 ./deploy/start-router-ubuntu.sh
-```
-
-If your server cargo is old and shows lockfile error like "lock file version 4 requires -Znext-lockfile-bump":
-
-```bash
-rm -f Cargo.lock
-cargo generate-lockfile
-cargo build --release
-```
-
-The Ubuntu run script already handles this automatically when using cargo mode.
-
-## GitHub Actions Auto Build
-
-Repository includes workflow:
-
-- `.github/workflows/build-linux.yml`
-
-When new code is pushed, GitHub Actions automatically builds:
-
-- target: `x86_64-unknown-linux-gnu`
-- binary: `llm-router`
-
-Download steps:
-
-1. Open repository `Actions` tab.
-2. Open latest `Build Linux Binary` run.
-3. Download artifact named `llm-router-linux-x86_64-<commit_sha>`.
+所以你 clone 这个仓库时，`release/` 目录里就已经有了最新编译好的二进制和前端页面。
 
 ## Security Notes
 
