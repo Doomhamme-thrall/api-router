@@ -45,29 +45,15 @@ Server starts at `0.0.0.0:8080` by default.
 
 ## One-Click Deployment (Ubuntu/Debian)
 
-一键部署到服务器，自动注册 systemd 服务：
-
 ```bash
-sudo bash deploy/deploy-ubuntu.sh
-```
-
-脚本默认使用 `release/` 下的预编译二进制，无需安装 Rust/Node.js。
-如需从源码编译：
-
-```bash
-SKIP_BUILD=0 sudo bash deploy/deploy-ubuntu.sh
+bash deploy/deploy-ubuntu.sh
 ```
 
 ## One-Click Deployment (Windows)
 
-以管理员身份运行 PowerShell：
-
 ```powershell
 .\deploy\deploy-windows.ps1
 ```
-
-脚本使用 NSSM 注册为 Windows 系统服务。
-加 `-SkipBuild:$false` 从源码编译（需要 Rust + Node.js）。
 
 ## OpenAI-Compatible Call Example
 
