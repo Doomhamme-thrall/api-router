@@ -135,7 +135,7 @@ async fn ui_index() -> impl IntoResponse {
 
 /// Serve static files under `/ui/*path` with SPA fallback
 async fn ui_handler(axum::extract::Path(path): axum::extract::Path<String>) -> impl IntoResponse {
-    let base = std::path::Path::new("ui/dist");
+    let base = std::path::Path::new("release/ui");
     let clean_path = path.trim_start_matches('/');
 
     if !clean_path.is_empty() {
@@ -170,7 +170,7 @@ async fn ui_handler(axum::extract::Path(path): axum::extract::Path<String>) -> i
 }
 
 async fn ui_serve_index() -> axum::response::Response {
-    match tokio::fs::read_to_string("ui/dist/index.html").await {
+    match tokio::fs::read_to_string("release/ui/index.html").await {
         Ok(html) => Html(html).into_response(),
         Err(_) => (StatusCode::NOT_FOUND, "Not found").into_response(),
     }
