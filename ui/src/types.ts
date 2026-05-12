@@ -1,7 +1,6 @@
 export interface Target {
   id: string
   name: string
-  provider: string
   api_format: string
   base_url: string
   api_key: string

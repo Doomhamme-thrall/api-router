@@ -53,7 +53,6 @@ export default function TargetsPage({ token, targets, onRefresh }: Props) {
   // Create form state
   const [form, setForm] = useState({
     name: '',
-    provider: '',
     api_format: 'openai',
     base_url: '',
     api_key: '',
@@ -62,7 +61,7 @@ export default function TargetsPage({ token, targets, onRefresh }: Props) {
   })
 
   const resetForm = () => {
-    setForm({ name: '', provider: '', api_format: 'openai', base_url: '', api_key: '', router_model: '', upstream_model: '' })
+    setForm({ name: '', api_format: 'openai', base_url: '', api_key: '', router_model: '', upstream_model: '' })
   }
 
   const handleCreate = async () => {
@@ -165,10 +164,6 @@ export default function TargetsPage({ token, targets, onRefresh }: Props) {
                 <Input id="f_name" value={form.name} onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))} placeholder="OpenAI Primary" />
               </div>
               <div className="space-y-2">
-                <Label htmlFor="f_provider">Provider</Label>
-                <Input id="f_provider" value={form.provider} onChange={(e) => setForm((f) => ({ ...f, provider: e.target.value }))} placeholder="openai" />
-              </div>
-              <div className="space-y-2">
                 <Label htmlFor="f_api_format">API Format</Label>
                 <select
                   id="f_api_format"
@@ -239,7 +234,7 @@ export default function TargetsPage({ token, targets, onRefresh }: Props) {
                         </Badge>
                       </div>
                       <p className="text-xs text-muted-foreground mt-0.5 truncate">
-                        {target.provider} · {target.router_model}
+                        {target.router_model}
                       </p>
                     </div>
                     <span className="text-[11px] text-muted-foreground font-mono">{target.id.slice(0, 8)}</span>
@@ -256,14 +251,6 @@ export default function TargetsPage({ token, targets, onRefresh }: Props) {
                           <Input
                             defaultValue={target.name}
                             id={`t_name_${target.id}`}
-                            className="h-8 text-xs"
-                          />
-                        </div>
-                        <div className="space-y-1.5">
-                          <Label className="text-[11px]">Provider</Label>
-                          <Input
-                            defaultValue={target.provider}
-                            id={`t_provider_${target.id}`}
                             className="h-8 text-xs"
                           />
                         </div>
@@ -345,7 +332,6 @@ export default function TargetsPage({ token, targets, onRefresh }: Props) {
                           onClick={() => {
                             const payload: Partial<Target> = {
                               name: (document.getElementById(`t_name_${target.id}`) as HTMLInputElement)?.value,
-                              provider: (document.getElementById(`t_provider_${target.id}`) as HTMLInputElement)?.value,
                               api_format: (document.getElementById(`t_api_format_${target.id}`) as HTMLSelectElement)?.value,
                               base_url: (document.getElementById(`t_base_url_${target.id}`) as HTMLInputElement)?.value,
                               api_key: (document.getElementById(`t_api_key_${target.id}`) as HTMLInputElement)?.value,

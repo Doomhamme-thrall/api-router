@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useCallback } from 'react'
 import { toast } from 'sonner'
 import { Plus, Save, Trash2, ChevronRight, Network } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -38,6 +38,19 @@ export default function GroupsPage({ token, groups, targets, onRefresh }: Props)
   const [formName, setFormName] = useState('')
   const [formEnabled, setFormEnabled] = useState(true)
   const [formTargetIds, setFormTargetIds] = useState<string[]>([])
+
+  // Edit state per expanded group (keyed by group id)
+  const [editStates, setEditStates] = useState<Record<string, { name: string; enabled: boolean; target_ids: string[] }>>({})
+
+  const initEditState = useCallback((group: ModelGroup) => {
+    setEditStates((prev) => ({
+      ...prev,
+      [group.id]: { name: group.name, enabled: group.enabled, target_ids: [...(group.target_ids || [])] },
+    }))
+  }, [])
+
+  const getEditState = (group: ModelGroup) =>
+    editStates[group.id] ?? { name: group.name, enabled: group.enabled, target_ids: [...(group.target_ids || [])] }
 
   const resetForm = () => {
     setFormName('')
@@ -195,7 +208,14 @@ export default function GroupsPage({ token, groups, targets, onRefresh }: Props)
                 className={`transition-all duration-200 ${isExpanded ? 'ring-1 ring-ring' : 'hover:border-muted-foreground/20'}`}
               >
                 <button
-                  onClick={() => setExpandedId(isExpanded ? null : group.id)}
+                  onClick={() => {
+                    if (isExpanded) {
+                      setExpandedId(null)
+                    } else {
+                      initEditState(group)
+                      setExpandedId(group.id)
+                    }
+                  }}
                   className="w-full text-left"
                 >
                   <CardHeader className="flex flex-row items-center gap-3 py-3 px-4">
@@ -221,91 +241,107 @@ export default function GroupsPage({ token, groups, targets, onRefresh }: Props)
                   </CardHeader>
                 </button>
 
-                {isExpanded && (
-                  <>
-                    <Separator />
-                    <CardContent className="p-4 space-y-4">
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                        <div className="space-y-1.5">
-                          <Label className="text-[11px]">Group Name</Label>
-                          <Input
-                            defaultValue={group.name}
-                            id={`mg_name_${group.id}`}
-                            className="h-8 text-xs"
-                          />
-                        </div>
-                        <div className="space-y-1.5">
-                          <Label className="text-[11px]">Enabled</Label>
-                          <select
-                            defaultValue={String(group.enabled)}
-                            id={`mg_enabled_${group.id}`}
-                            className="flex h-8 w-full rounded-md border border-input bg-background px-2 py-1 text-xs ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
-                          >
-                            <option value="true">true</option>
-                            <option value="false">false</option>
-                          </select>
-                        </div>
-                      </div>
-
-                      <div className="space-y-2">
-                        <Label className="text-[11px]">Members</Label>
-                        {targets.length === 0 ? (
-                          <p className="text-xs text-muted-foreground">No targets available.</p>
-                        ) : (
-                          <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
-                            {targets.map((t) => {
-                              const checked = (group.target_ids || []).includes(t.id)
-                              return (
-                                <label
-                                  key={t.id}
-                                  className="flex items-center gap-2 p-2 rounded-md border hover:bg-accent/50 cursor-pointer transition-colors"
-                                >
-                                  <Checkbox
-                                    defaultChecked={checked}
-                                    className="data-[state=checked]:bg-primary"
-                                    id={`mg_cb_${group.id}_${t.id}`}
-                                  />
-                                  <span className="text-xs">{t.name}</span>
-                                </label>
-                              )
-                            })}
+                {isExpanded && (() => {
+                  const editState = getEditState(group)
+                  return (
+                    <>
+                      <Separator />
+                      <CardContent className="p-4 space-y-4">
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                          <div className="space-y-1.5">
+                            <Label className="text-[11px]">Group Name</Label>
+                            <Input
+                              value={editState.name}
+                              onChange={(e) =>
+                                setEditStates((prev) => ({
+                                  ...prev,
+                                  [group.id]: { ...prev[group.id], name: e.target.value },
+                                }))
+                              }
+                              className="h-8 text-xs"
+                            />
                           </div>
-                        )}
-                      </div>
+                          <div className="space-y-1.5">
+                            <Label className="text-[11px]">Enabled</Label>
+                            <select
+                              value={String(editState.enabled)}
+                              onChange={(e) =>
+                                setEditStates((prev) => ({
+                                  ...prev,
+                                  [group.id]: { ...prev[group.id], enabled: e.target.value === 'true' },
+                                }))
+                              }
+                              className="flex h-8 w-full rounded-md border border-input bg-background px-2 py-1 text-xs ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                            >
+                              <option value="true">true</option>
+                              <option value="false">false</option>
+                            </select>
+                          </div>
+                        </div>
 
-                      <div className="flex items-center gap-2 pt-2">
-                        <Button
-                          size="sm"
-                          variant="default"
-                          onClick={() => {
-                            const selected: string[] = []
-                            targets.forEach((t) => {
-                              const cb = document.getElementById(`mg_cb_${group.id}_${t.id}`) as HTMLInputElement
-                              if (cb?.checked) selected.push(t.id)
-                            })
-                            const payload: Partial<ModelGroup> = {
-                              name: (document.getElementById(`mg_name_${group.id}`) as HTMLInputElement)?.value,
-                              enabled: (document.getElementById(`mg_enabled_${group.id}`) as HTMLSelectElement)?.value === 'true',
-                              target_ids: selected,
-                            }
-                            handleUpdate(group.id, payload)
-                          }}
-                        >
-                          <Save className="h-3.5 w-3.5 mr-1" />
-                          Save
-                        </Button>
-                        <Button
-                          size="sm"
-                          variant="destructive"
-                          onClick={() => handleDelete(group.id, group.name)}
-                        >
-                          <Trash2 className="h-3.5 w-3.5 mr-1" />
-                          Delete
-                        </Button>
-                      </div>
-                    </CardContent>
-                  </>
-                )}
+                        <div className="space-y-2">
+                          <Label className="text-[11px]">Members</Label>
+                          {targets.length === 0 ? (
+                            <p className="text-xs text-muted-foreground">No targets available.</p>
+                          ) : (
+                            <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                              {targets.map((t) => {
+                                const checked = editState.target_ids.includes(t.id)
+                                return (
+                                  <label
+                                    key={t.id}
+                                    className="flex items-center gap-2 p-2 rounded-md border hover:bg-accent/50 cursor-pointer transition-colors"
+                                  >
+                                    <Checkbox
+                                      checked={checked}
+                                      onCheckedChange={(chk) => {
+                                        setEditStates((prev) => {
+                                          const curr = prev[group.id]
+                                          const tid = curr.target_ids.includes(t.id)
+                                            ? curr.target_ids.filter((id) => id !== t.id)
+                                            : [...curr.target_ids, t.id]
+                                          return { ...prev, [group.id]: { ...curr, target_ids: tid } }
+                                        })
+                                      }}
+                                      className="data-[state=checked]:bg-primary"
+                                    />
+                                    <span className="text-xs">{t.name}</span>
+                                  </label>
+                                )
+                              })}
+                            </div>
+                          )}
+                        </div>
+
+                        <div className="flex items-center gap-2 pt-2">
+                          <Button
+                            size="sm"
+                            variant="default"
+                            onClick={() => {
+                              const payload: Partial<ModelGroup> = {
+                                name: editState.name,
+                                enabled: editState.enabled,
+                                target_ids: editState.target_ids,
+                              }
+                              handleUpdate(group.id, payload)
+                            }}
+                          >
+                            <Save className="h-3.5 w-3.5 mr-1" />
+                            Save
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="destructive"
+                            onClick={() => handleDelete(group.id, group.name)}
+                          >
+                            <Trash2 className="h-3.5 w-3.5 mr-1" />
+                            Delete
+                          </Button>
+                        </div>
+                      </CardContent>
+                    </>
+                  )
+                })()}
               </Card>
             )
           })}

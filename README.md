@@ -32,7 +32,6 @@ vim config/router.json
 ```
 
 CI 每次推送到 `main` 分支时自动编译并将二进制提交到 `release/` 目录，
-所以你 clone 的仓库里就已经有可直接运行的二进制了。
 
 ### 从源码编译（开发者）
 
@@ -114,7 +113,7 @@ Requires `Authorization: Bearer <admin_jwt>`.
 - `jwt_secret`
 - `client_api_keys[]`
 - `targets[]`:
-  - `id`, `name`, `provider`, `api_format`, `base_url`, `api_key`
+  - `id`, `name`, `api_format`, `base_url`, `api_key`
   - `router_model`, `upstream_model`, `enabled`
 - `model_groups[]`:
   - `id`, `name`, `target_ids[]`, `enabled`
@@ -148,7 +147,6 @@ Gemini target example:
 {
   "id": "f0f7e4be-4c77-4ae3-9058-1d9a14cbf7a1",
   "name": "gemini-flash",
-  "provider": "google",
   "api_format": "gemini",
   "base_url": "https://generativelanguage.googleapis.com",
   "api_key": "AIza...",
