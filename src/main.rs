@@ -30,7 +30,7 @@ mod usage;
 
 use config::{load_config, normalize_usage_log_dir};
 use state::AppState;
-use usage::load_call_records_from_disk;
+use usage::{load_call_records_from_disk, load_group_usage_from_disk};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -62,7 +62,13 @@ async fn main() -> anyhow::Result<()> {
 
     let usage_log_dir = normalize_usage_log_dir(usage_log_dir);
 
+    let group_usage_log_dir = std::env::var("ROUTER_GROUP_USAGE_LOG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("data/group-usage"));
+
     let existing_records = load_call_records_from_disk(&usage_log_dir, max_call_records).await;
+    let existing_group_usage = load_group_usage_from_disk(&group_usage_log_dir).await
+        .unwrap_or_default();
 
     let state = AppState {
         cfg_path,
@@ -79,6 +85,8 @@ async fn main() -> anyhow::Result<()> {
         upstream_timeout_secs,
         call_records: Arc::new(RwLock::new(existing_records)),
         max_call_records,
+        group_usage: Arc::new(RwLock::new(existing_group_usage)),
+        group_usage_log_dir,
     };
 
     let app = Router::new()
@@ -101,6 +109,7 @@ async fn main() -> anyhow::Result<()> {
             "/admin/model-groups/:id",
             put(admin::admin_update_model_group).delete(admin::admin_delete_model_group),
         )
+        .route("/admin/model-groups/quota", get(admin::admin_list_group_quota))
         .route("/admin/test-target/:id", get(admin::admin_test_target))
         .route("/admin/stats", get(admin::admin_get_stats))
         .route("/ui", get(ui_index))

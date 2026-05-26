@@ -8,6 +8,8 @@ use axum::Json;
 use serde_json::{json, Value};
 use tracing::error;
 
+use chrono::Utc;
+
 use crate::auth::{admin_login, api_error, require_admin, AdminLoginRequest};
 use crate::config::{
     is_gemini_format, normalize_api_format, build_upstream_url, save_config,
@@ -150,6 +152,7 @@ pub async fn admin_create_model_group(
         name: req.name,
         target_ids: req.target_ids,
         enabled: req.enabled,
+        token_quota: req.token_quota,
     };
 
     {
@@ -214,6 +217,7 @@ pub async fn admin_update_model_group(
         group.name = req.name;
         group.target_ids = req.target_ids;
         group.enabled = req.enabled;
+        group.token_quota = req.token_quota;
 
         if let Err(err) = save_config(&state.cfg_path, &cfg).await {
             error!("failed to save config: {}", err);
@@ -252,6 +256,45 @@ pub async fn admin_delete_model_group(
     }
 
     Json(json!({"ok": true})).into_response()
+}
+
+pub async fn admin_list_group_quota(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(resp) = require_admin(&state, &headers).await {
+        return resp;
+    }
+
+    let cfg = state.cfg.read().await;
+    let usage = state.group_usage.read().await;
+    let now = Utc::now().timestamp();
+
+    let items: Vec<Value> = cfg
+        .model_groups
+        .iter()
+        .map(|g| {
+            let quota = g.token_quota.as_ref().map(|q| {
+                let consumed = usage
+                    .get(&g.id)
+                    .map(|records| crate::usage::sum_group_tokens_in_window(records, now, q.window_seconds))
+                    .unwrap_or(0);
+                json!({
+                    "limit": q.limit,
+                    "window_seconds": q.window_seconds,
+                    "consumed": consumed,
+                    "exceeded": consumed >= q.limit,
+                })
+            });
+            json!({
+                "id": g.id,
+                "name": g.name,
+                "token_quota": quota,
+            })
+        })
+        .collect();
+
+    Json(json!({"items": items})).into_response()
 }
 
 pub async fn admin_test_target(

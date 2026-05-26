@@ -1,10 +1,13 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc, sync::atomic::AtomicUsize};
+use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
+use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
 
 use reqwest::Client;
 use tokio::sync::RwLock;
 
 use crate::config::RouterConfig;
-use crate::usage::CallRecord;
+use crate::usage::{CallRecord, GroupUsageRecord};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -17,4 +20,6 @@ pub struct AppState {
     pub upstream_timeout_secs: u64,
     pub call_records: Arc<RwLock<Vec<CallRecord>>>,
     pub max_call_records: usize,
+    pub group_usage: Arc<RwLock<HashMap<String, VecDeque<GroupUsageRecord>>>>,
+    pub group_usage_log_dir: PathBuf,
 }

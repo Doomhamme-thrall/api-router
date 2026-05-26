@@ -42,6 +42,14 @@ pub struct ModelGroup {
     #[serde(default)]
     pub target_ids: Vec<String>,
     pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_quota: Option<TokenQuota>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenQuota {
+    pub limit: u64,
+    pub window_seconds: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -62,6 +70,8 @@ pub struct UpsertModelGroupRequest {
     #[serde(default)]
     pub target_ids: Vec<String>,
     pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_quota: Option<TokenQuota>,
 }
 
 fn default_api_format() -> String {

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::Ordering;
 
 use axum::body::Body;
@@ -17,8 +17,9 @@ use crate::gemini::{
 };
 use crate::state::AppState;
 use crate::usage::{
-    append_call_record_to_disk, extract_tokens_from_bytes, extract_tokens_from_sse_bytes,
-    extract_tokens_from_value, CallRecord,
+    append_call_record_to_disk, append_group_usage_to_disk, extract_tokens_from_bytes,
+    extract_tokens_from_sse_bytes, extract_tokens_from_value, sum_group_tokens_in_window,
+    CallRecord, GroupUsageRecord,
 };
 
 pub async fn proxy_chat_completions(
@@ -155,6 +156,7 @@ async fn proxy_openai_request(
 
             if !is_streaming {
                 record_call(&state, &target, true, pt, ct, tt).await;
+                record_group_usage(&state, requested_model.as_deref(), tt).await;
                 let mut response = Response::new(Body::from(openai_like.to_string()));
                 *response.status_mut() = status;
                 response.headers_mut().insert(
@@ -166,6 +168,7 @@ async fn proxy_openai_request(
 
             let sse_body = build_openai_sse_from_completion(&openai_like);
             record_call(&state, &target, true, pt, ct, tt).await;
+            record_group_usage(&state, requested_model.as_deref(), tt).await;
             let mut response = Response::new(Body::from(sse_body));
             *response.status_mut() = status;
             response.headers_mut().insert(
@@ -214,6 +217,7 @@ async fn proxy_openai_request(
                 Ok(bytes) => {
                     let (pt, ct, tt) = extract_tokens_from_bytes(&bytes);
                     record_call(&state, &target, true, pt, ct, tt).await;
+                    record_group_usage(&state, requested_model.as_deref(), tt).await;
                     let body = Body::from(bytes);
                     let mut response = Response::new(body);
                     *response.status_mut() = status;
@@ -234,6 +238,7 @@ async fn proxy_openai_request(
                 Ok(bytes) => {
                     let (pt, ct, tt) = extract_tokens_from_sse_bytes(&bytes);
                     record_call(&state, &target, true, pt, ct, tt).await;
+                    record_group_usage(&state, requested_model.as_deref(), tt).await;
                     let body = Body::from(bytes);
                     let mut response = Response::new(body);
                     *response.status_mut() = status;
@@ -285,9 +290,22 @@ async fn pick_global_target_candidates(state: &AppState) -> Vec<crate::config::U
 
 async fn model_group_exists(state: &AppState, group_name: &str) -> bool {
     let cfg = state.cfg.read().await;
-    cfg.model_groups
-        .iter()
-        .any(|g| g.enabled && g.name == group_name)
+    let Some(group) = cfg.model_groups.iter().find(|g| g.enabled && g.name == group_name) else {
+        return false;
+    };
+    // If group has a quota, check if it's exceeded
+    if let Some(ref quota) = group.token_quota {
+        let now = Utc::now().timestamp();
+        let usage = state.group_usage.read().await;
+        let records = usage.get(&group.id);
+        if let Some(records) = records {
+            let total = sum_group_tokens_in_window(records, now, quota.window_seconds);
+            if total >= quota.limit {
+                return false; // quota exceeded, treat group as non-existent
+            }
+        }
+    }
+    true
 }
 
 async fn pick_target_candidates_from_group(state: &AppState, group_name: &str) -> Vec<crate::config::UpstreamTarget> {
@@ -365,5 +383,43 @@ async fn record_call(
 
     if let Err(err) = append_call_record_to_disk(&state.usage_log_dir, &record).await {
         error!("failed to append usage record to disk: {}", err);
+    }
+}
+
+/// Record token usage for a group (if the request was routed through a group).
+/// Deduces the group from the requested model name.
+async fn record_group_usage(
+    state: &AppState,
+    requested_model: Option<&str>,
+    total_tokens: u64,
+) {
+    let Some(model_name) = requested_model else { return };
+    if total_tokens == 0 { return; }
+
+    let group_id = {
+        let cfg = state.cfg.read().await;
+        cfg.model_groups
+            .iter()
+            .find(|g| g.enabled && g.name == model_name)
+            .map(|g| g.id.clone())
+    };
+    let Some(group_id) = group_id else { return };
+
+    let now = Utc::now().timestamp();
+    let record = GroupUsageRecord {
+        group_id: group_id.clone(),
+        timestamp: now,
+        total_tokens,
+    };
+
+    {
+        let mut usage = state.group_usage.write().await;
+        usage.entry(group_id.clone())
+            .or_insert_with(VecDeque::new)
+            .push_back(record.clone());
+    }
+
+    if let Err(err) = append_group_usage_to_disk(&state.group_usage_log_dir, &record).await {
+        error!("failed to append group usage record to disk: {}", err);
     }
 }

@@ -14,6 +14,23 @@ export interface ModelGroup {
   name: string
   target_ids: string[]
   enabled: boolean
+  token_quota?: TokenQuota | null
+}
+
+export interface TokenQuota {
+  limit: number
+  window_seconds: number
+}
+
+export interface GroupQuotaStatus {
+  id: string
+  name: string
+  token_quota?: {
+    limit: number
+    window_seconds: number
+    consumed: number
+    exceeded: boolean
+  } | null
 }
 
 export interface StatsItem {

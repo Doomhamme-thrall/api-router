@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 
 use chrono::{TimeZone, Utc};
@@ -284,4 +284,93 @@ pub async fn aggregate_usage_from_disk(
         }
     }
     Ok(agg)
+}
+
+// ── Group-level token usage tracking ──
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupUsageRecord {
+    pub group_id: String,
+    pub timestamp: i64,
+    pub total_tokens: u64,
+}
+
+/// Load group usage records from disk. Returns a map of group_id -> recent records.
+pub async fn load_group_usage_from_disk(
+    group_usage_dir: &Path,
+) -> anyhow::Result<HashMap<String, VecDeque<GroupUsageRecord>>> {
+    let mut result: HashMap<String, VecDeque<GroupUsageRecord>> = HashMap::new();
+    let mut rd = match fs::read_dir(group_usage_dir).await {
+        Ok(v) => v,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(result),
+        Err(err) => return Err(err.into()),
+    };
+
+    while let Some(entry) = rd.next_entry().await? {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(".jsonl") {
+            continue;
+        }
+        let group_id = name.trim_end_matches(".jsonl").to_string();
+
+        let body = match fs::read_to_string(&path).await {
+            Ok(v) => v,
+            Err(err) => {
+                error!("failed to read group usage log {}: {}", path.display(), err);
+                continue;
+            }
+        };
+
+        let mut records: VecDeque<GroupUsageRecord> = VecDeque::new();
+        for line in body.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(record) = serde_json::from_str::<GroupUsageRecord>(line) {
+                records.push_back(record);
+            }
+        }
+        result.insert(group_id, records);
+    }
+
+    Ok(result)
+}
+
+/// Append a group usage record to disk (one JSONL line per record).
+/// Uses a single file per group: <group_usage_dir>/<group_id>.jsonl
+pub async fn append_group_usage_to_disk(
+    group_usage_dir: &Path,
+    record: &GroupUsageRecord,
+) -> anyhow::Result<()> {
+    fs::create_dir_all(group_usage_dir).await?;
+    let path = group_usage_dir.join(format!("{}.jsonl", record.group_id));
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .await?;
+    let line = serde_json::to_string(record)?;
+    file.write_all(line.as_bytes()).await?;
+    file.write_all(b"\n").await?;
+    Ok(())
+}
+
+/// Sum the total tokens from records within the given time window (now - window_seconds, now].
+pub fn sum_group_tokens_in_window(
+    records: &VecDeque<GroupUsageRecord>,
+    now: i64,
+    window_seconds: u64,
+) -> u64 {
+    let cutoff = now - window_seconds as i64;
+    records
+        .iter()
+        .filter(|r| r.timestamp >= cutoff)
+        .map(|r| r.total_tokens)
+        .sum()
 }
