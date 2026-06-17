@@ -1,0 +1,30 @@
+{
+  "admin": {
+    "username": "admin",
+    "password_sha256": "8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918"
+  },
+  "jwt_secret": "change-this-to-a-random-secret",
+  "client_api_keys": [
+    "your-api-key-here"
+  ],
+  "targets": [
+    {
+      "id": "example-target-1",
+      "name": "My LLM Provider",
+      "api_format": "openai",
+      "base_url": "https://api.openai.com",
+      "api_key": "sk-placeholder",
+      "router_model": "my-model",
+      "upstream_model": "gpt-4o-mini",
+      "enabled": true
+    }
+  ],
+  "model_groups": [
+    {
+      "id": "example-group-1",
+      "name": "my-group",
+      "target_ids": ["example-target-1"],
+      "enabled": true
+    }
+  ]
+}

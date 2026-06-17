@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::Ordering;
 
 use axum::body::Body;
@@ -7,7 +7,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
 use chrono::Utc;
 use serde_json::{json, Value};
-use tracing::error;
+use tracing::{debug, error, info, warn};
 
 use crate::auth::{api_error, validate_client_api_key};
 use crate::config::{is_gemini_format, build_upstream_url};
@@ -44,9 +44,23 @@ async fn proxy_openai_request(
     route: &str,
     payload: &mut Value,
 ) -> Response {
+    let client_ip = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown");
+    let model_name = payload.get("model").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let is_streaming = payload.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    info!(
+        "proxy request: {} model={} stream={} route={}",
+        client_ip, model_name, is_streaming, route,
+    );
+
     if let Err(resp) = validate_client_api_key(&state, &headers).await {
+        warn!("api key validation failed from {}", client_ip);
         return resp;
     }
+    debug!("api key validated for request model={}", model_name);
 
     let requested_model = payload
         .get("model")
@@ -55,13 +69,13 @@ async fn proxy_openai_request(
 
     let candidates = pick_target_candidates_for_request(&state, requested_model.as_deref()).await;
     if candidates.is_empty() {
+        warn!("no candidates found for model={}", model_name);
         return api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "no enabled upstream target for requested route",
         );
     }
 
-    let is_streaming = payload.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
     let mut last_err_message = String::from("upstream request failed");
 
     // For streaming OpenAI-compatible requests, inject stream_options.include_usage
@@ -73,6 +87,7 @@ async fn proxy_openai_request(
     }
 
     for target in candidates {
+        debug!("trying target: {} (upstream_model={})", target.name, target.upstream_model);
         let mut attempt_payload = payload.clone();
         attempt_payload["model"] = Value::String(target.upstream_model.clone());
 
@@ -157,6 +172,7 @@ async fn proxy_openai_request(
             if !is_streaming {
                 record_call(&state, &target, true, pt, ct, tt).await;
                 record_group_usage(&state, requested_model.as_deref(), tt).await;
+                info!("gemini success: target={} tokens={} (pt={}, ct={})", target.name, tt, pt, ct);
                 let mut response = Response::new(Body::from(openai_like.to_string()));
                 *response.status_mut() = status;
                 response.headers_mut().insert(
@@ -169,6 +185,7 @@ async fn proxy_openai_request(
             let sse_body = build_openai_sse_from_completion(&openai_like);
             record_call(&state, &target, true, pt, ct, tt).await;
             record_group_usage(&state, requested_model.as_deref(), tt).await;
+            info!("gemini success (streaming): target={} tokens={}", target.name, tt);
             let mut response = Response::new(Body::from(sse_body));
             *response.status_mut() = status;
             response.headers_mut().insert(
@@ -218,6 +235,7 @@ async fn proxy_openai_request(
                     let (pt, ct, tt) = extract_tokens_from_bytes(&bytes);
                     record_call(&state, &target, true, pt, ct, tt).await;
                     record_group_usage(&state, requested_model.as_deref(), tt).await;
+                    info!("openai success: target={} tokens={} (pt={}, ct={})", target.name, tt, pt, ct);
                     let body = Body::from(bytes);
                     let mut response = Response::new(body);
                     *response.status_mut() = status;
@@ -239,6 +257,7 @@ async fn proxy_openai_request(
                     let (pt, ct, tt) = extract_tokens_from_sse_bytes(&bytes);
                     record_call(&state, &target, true, pt, ct, tt).await;
                     record_group_usage(&state, requested_model.as_deref(), tt).await;
+                    info!("openai success (streaming): target={} tokens={}", target.name, tt);
                     let body = Body::from(bytes);
                     let mut response = Response::new(body);
                     *response.status_mut() = status;
@@ -277,9 +296,36 @@ fn rotate_targets(candidates: Vec<crate::config::UpstreamTarget>, start: usize) 
         .collect()
 }
 
+/// Check if a target has a token quota that has been exceeded.
+fn is_target_quota_exceeded(
+    target: &crate::config::UpstreamTarget,
+    usage: &HashMap<String, VecDeque<GroupUsageRecord>>,
+    now: i64,
+) -> bool {
+    let Some(ref quota) = target.token_quota else { return false };
+    let Some(records) = usage.get(&target.id) else { return false };
+    let total = sum_group_tokens_in_window(records, now, quota.window_seconds);
+    if total >= quota.limit {
+        warn!(
+            "target '{}' quota exceeded: {}/{} tokens in {}s window",
+            target.name, total, quota.limit, quota.window_seconds,
+        );
+        return true;
+    }
+    false
+}
+
 async fn pick_global_target_candidates(state: &AppState) -> Vec<crate::config::UpstreamTarget> {
     let cfg = state.cfg.read().await;
-    let enabled: Vec<crate::config::UpstreamTarget> = cfg.targets.iter().filter(|t| t.enabled).cloned().collect();
+    let now = Utc::now().timestamp();
+    let usage = state.target_usage.read().await;
+    let enabled: Vec<crate::config::UpstreamTarget> = cfg.targets
+        .iter()
+        .filter(|t| t.enabled && !is_target_quota_exceeded(t, &usage, now))
+        .cloned()
+        .collect();
+    drop(usage);
+    drop(cfg);
     if enabled.is_empty() {
         return Vec::new();
     }
@@ -291,6 +337,7 @@ async fn pick_global_target_candidates(state: &AppState) -> Vec<crate::config::U
 async fn model_group_exists(state: &AppState, group_name: &str) -> bool {
     let cfg = state.cfg.read().await;
     let Some(group) = cfg.model_groups.iter().find(|g| g.enabled && g.name == group_name) else {
+        debug!("group name='{}' not found or disabled", group_name);
         return false;
     };
     // If group has a quota, check if it's exceeded
@@ -301,10 +348,19 @@ async fn model_group_exists(state: &AppState, group_name: &str) -> bool {
         if let Some(records) = records {
             let total = sum_group_tokens_in_window(records, now, quota.window_seconds);
             if total >= quota.limit {
+                warn!(
+                    "group '{}' quota exceeded: {}/{} tokens in {}s window",
+                    group.name, total, quota.limit, quota.window_seconds,
+                );
                 return false; // quota exceeded, treat group as non-existent
             }
+            debug!(
+                "group '{}' quota: {}/{} tokens used",
+                group.name, total, quota.limit,
+            );
         }
     }
+    debug!("group '{}' resolved successfully ({}/{} targets)", group.name, group.target_ids.len(), group.target_ids.len());
     true
 }
 
@@ -321,15 +377,23 @@ async fn pick_target_candidates_from_group(state: &AppState, group_name: &str) -
     let group_target_ids = group.target_ids.clone();
 
     let selected_ids: HashSet<&str> = group_target_ids.iter().map(String::as_str).collect();
+    let now = Utc::now().timestamp();
+    let target_usage = state.target_usage.read().await;
     let candidates: Vec<crate::config::UpstreamTarget> = cfg
         .targets
         .iter()
-        .filter(|t| t.enabled && selected_ids.contains(t.id.as_str()))
+        .filter(|t| {
+            t.enabled
+                && selected_ids.contains(t.id.as_str())
+                && !is_target_quota_exceeded(t, &target_usage, now)
+        })
         .cloned()
         .collect();
+    drop(target_usage);
     drop(cfg);
 
     if candidates.is_empty() {
+        warn!("group '{}' has no enabled targets among its {} members", group_name, group_target_ids.len());
         return Vec::new();
     }
 
@@ -337,6 +401,15 @@ async fn pick_target_candidates_from_group(state: &AppState, group_name: &str) -
     let counter = rr_map.entry(group_id).or_insert(0);
     let idx = *counter;
     *counter = counter.wrapping_add(1);
+    let rr_idx = idx % candidates.len();
+
+    debug!(
+        "group '{}' rr_idx={}/{} candidates: {}",
+        group_name,
+        rr_idx,
+        candidates.len(),
+        candidates.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", "),
+    );
 
     rotate_targets(candidates, idx)
 }
@@ -384,6 +457,51 @@ async fn record_call(
     if let Err(err) = append_call_record_to_disk(&state.usage_log_dir, &record).await {
         error!("failed to append usage record to disk: {}", err);
     }
+
+    // Also record target-level token quota usage if applicable
+    record_target_usage(state, &target.id, &target.name, total_tokens).await;
+}
+
+async fn record_target_usage(
+    state: &AppState,
+    target_id: &str,
+    target_name: &str,
+    total_tokens: u64,
+) {
+    // Check if this target has a quota configured before recording
+    let has_quota = {
+        let cfg = state.cfg.read().await;
+        cfg.targets
+            .iter()
+            .any(|t| t.id == target_id && t.token_quota.is_some())
+    };
+    if !has_quota || total_tokens == 0 {
+        return;
+    }
+
+    let now = Utc::now().timestamp();
+    let record = GroupUsageRecord {
+        group_id: target_id.to_string(), // reuse field name for persistence
+        timestamp: now,
+        total_tokens,
+    };
+
+    {
+        let mut usage = state.target_usage.write().await;
+        usage
+            .entry(target_id.to_string())
+            .or_insert_with(VecDeque::new)
+            .push_back(record.clone());
+    }
+
+    debug!(
+        "target usage recorded: target={} tokens={}",
+        target_name, total_tokens,
+    );
+
+    if let Err(err) = append_group_usage_to_disk(&state.target_usage_log_dir, &record).await {
+        error!("failed to append target usage record to disk: {}", err);
+    }
 }
 
 /// Record token usage for a group (if the request was routed through a group).
@@ -418,6 +536,8 @@ async fn record_group_usage(
             .or_insert_with(VecDeque::new)
             .push_back(record.clone());
     }
+
+    debug!("group usage recorded: group_id={} tokens={}", group_id, total_tokens);
 
     if let Err(err) = append_group_usage_to_disk(&state.group_usage_log_dir, &record).await {
         error!("failed to append group usage record to disk: {}", err);

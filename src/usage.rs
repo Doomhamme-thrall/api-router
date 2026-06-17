@@ -5,7 +5,7 @@ use chrono::{TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
-use tracing::error;
+use tracing::{debug, error, info};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallRecord {
@@ -189,6 +189,7 @@ pub async fn append_call_record_to_disk(dir: &Path, record: &CallRecord) -> anyh
     let line = serde_json::to_string(record)?;
     file.write_all(line.as_bytes()).await?;
     file.write_all(b"\n").await?;
+    debug!("call record appended to {}", path.file_name().unwrap_or_default().to_string_lossy());
     Ok(())
 }
 
@@ -201,6 +202,8 @@ pub async fn load_call_records_from_disk(dir: &Path, max_records: usize) -> Vec<
         }
     };
 
+    info!("loading usage records from {} files in {}", files.len(), dir.display());
+
     let mut items = Vec::new();
     for path in files {
         let body = match fs::read_to_string(&path).await {
@@ -210,6 +213,9 @@ pub async fn load_call_records_from_disk(dir: &Path, max_records: usize) -> Vec<
                 continue;
             }
         };
+
+        let line_count = body.lines().filter(|l| !l.trim().is_empty()).count();
+        debug!("reading usage file {} ({} lines)", path.file_name().unwrap_or_default().to_string_lossy(), line_count);
 
         for (idx, line) in body.lines().enumerate() {
             if line.trim().is_empty() {
@@ -230,7 +236,9 @@ pub async fn load_call_records_from_disk(dir: &Path, max_records: usize) -> Vec<
     if items.len() > max_records {
         let drop_count = items.len() - max_records;
         items.drain(0..drop_count);
+        debug!("usage records trimmed: kept {} (max={})", items.len(), max_records);
     }
+    info!("loaded {} usage records from disk", items.len());
     items
 }
 
@@ -302,9 +310,14 @@ pub async fn load_group_usage_from_disk(
     let mut result: HashMap<String, VecDeque<GroupUsageRecord>> = HashMap::new();
     let mut rd = match fs::read_dir(group_usage_dir).await {
         Ok(v) => v,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(result),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            debug!("group usage dir not found: {}", group_usage_dir.display());
+            return Ok(result);
+        }
         Err(err) => return Err(err.into()),
     };
+
+    info!("loading group usage from {}", group_usage_dir.display());
 
     while let Some(entry) = rd.next_entry().await? {
         let path = entry.path();
@@ -327,6 +340,9 @@ pub async fn load_group_usage_from_disk(
             }
         };
 
+        let line_count = body.lines().filter(|l| !l.trim().is_empty()).count();
+        debug!("reading group usage file {} ({} records)", name, line_count);
+
         let mut records: VecDeque<GroupUsageRecord> = VecDeque::new();
         for line in body.lines() {
             if line.trim().is_empty() {
@@ -336,9 +352,11 @@ pub async fn load_group_usage_from_disk(
                 records.push_back(record);
             }
         }
+        debug!("loaded {} records for group {}", records.len(), group_id);
         result.insert(group_id, records);
     }
 
+    info!("loaded group usage for {} groups", result.len());
     Ok(result)
 }
 

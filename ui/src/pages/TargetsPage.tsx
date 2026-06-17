@@ -1,6 +1,7 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { toast } from 'sonner'
 import {
+  Gauge,
   Plus,
   Save,
   Trash2,
@@ -32,11 +33,12 @@ import {
   DialogTitle,
   DialogTrigger,
 } from '@/components/ui/dialog'
+import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Badge } from '@/components/ui/badge'
 import { Separator } from '@/components/ui/separator'
-import type { Target } from '@/types'
+import type { Target, TokenQuota } from '@/types'
 
 interface Props {
   token: string
@@ -59,9 +61,22 @@ export default function TargetsPage({ token, targets, onRefresh }: Props) {
     router_model: '',
     upstream_model: '',
   })
+  const [formQuotaEnabled, setFormQuotaEnabled] = useState(false)
+  const [formQuotaLimit, setFormQuotaLimit] = useState('')
+  const [formQuotaWindow, setFormQuotaWindow] = useState('')
 
   const resetForm = () => {
     setForm({ name: '', api_format: 'openai', base_url: '', api_key: '', router_model: '', upstream_model: '' })
+    setFormQuotaEnabled(false)
+    setFormQuotaLimit('')
+    setFormQuotaWindow('')
+  }
+
+  const buildTokenQuota = (limit: string, window: string): TokenQuota | null => {
+    const l = parseInt(limit, 10)
+    const w = parseInt(window, 10)
+    if (!formQuotaEnabled || isNaN(l) || l <= 0 || isNaN(w) || w <= 0) return null
+    return { limit: l, window_seconds: w }
   }
 
   const handleCreate = async () => {
@@ -69,7 +84,7 @@ export default function TargetsPage({ token, targets, onRefresh }: Props) {
       const res = await fetch('/admin/targets', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ ...form, enabled: true }),
+        body: JSON.stringify({ ...form, enabled: true, token_quota: buildTokenQuota(formQuotaLimit, formQuotaWindow) }),
       })
       if (!res.ok) throw new Error((await res.json()).error?.message || 'Create failed')
       toast.success('Target created')
@@ -192,6 +207,28 @@ export default function TargetsPage({ token, targets, onRefresh }: Props) {
                 <Input id="f_upstream_model" value={form.upstream_model} onChange={(e) => setForm((f) => ({ ...f, upstream_model: e.target.value }))} placeholder="gpt-4o-mini" />
               </div>
             </div>
+            <div className="space-y-2 border rounded-md p-3 -mt-2">
+              <div className="flex items-center gap-2">
+                <Checkbox
+                  id="f_quota_enabled"
+                  checked={formQuotaEnabled}
+                  onCheckedChange={(chk) => setFormQuotaEnabled(!!chk)}
+                />
+                <Label htmlFor="f_quota_enabled" className="text-sm font-medium cursor-pointer">Token Quota</Label>
+              </div>
+              {formQuotaEnabled && (
+                <div className="grid grid-cols-2 gap-3 pt-1">
+                  <div className="space-y-1">
+                    <Label className="text-[11px]">Token Limit</Label>
+                    <Input type="number" min="1" value={formQuotaLimit} onChange={(e) => setFormQuotaLimit(e.target.value)} placeholder="e.g. 1000000" className="h-8 text-xs" />
+                  </div>
+                  <div className="space-y-1">
+                    <Label className="text-[11px]">Window (seconds)</Label>
+                    <Input type="number" min="1" value={formQuotaWindow} onChange={(e) => setFormQuotaWindow(e.target.value)} placeholder="e.g. 86400 (24h)" className="h-8 text-xs" />
+                  </div>
+                </div>
+              )}
+            </div>
             <DialogFooter>
               <Button variant="outline" onClick={() => { setCreateOpen(false); resetForm() }}>Cancel</Button>
               <Button onClick={handleCreate}>Create</Button>
@@ -232,9 +269,20 @@ export default function TargetsPage({ token, targets, onRefresh }: Props) {
                         <Badge variant={target.enabled ? 'success' : 'warning'} className="shrink-0">
                           {target.enabled ? 'ON' : 'OFF'}
                         </Badge>
+                        {target.token_quota && (
+                          <Badge variant="outline" className="shrink-0 gap-1">
+                            <Gauge className="h-3 w-3" />
+                            {target.token_quota.limit >= 1000000
+                              ? `${(target.token_quota.limit / 1000000).toFixed(1)}M`
+                              : target.token_quota.limit >= 1000
+                                ? `${(target.token_quota.limit / 1000).toFixed(0)}K`
+                                : String(target.token_quota.limit)}t
+                          </Badge>
+                        )}
                       </div>
                       <p className="text-xs text-muted-foreground mt-0.5 truncate">
                         {target.router_model}
+                        {target.token_quota && ` · quota: ${target.token_quota.window_seconds >= 86400 ? `${target.token_quota.window_seconds / 86400}d` : target.token_quota.window_seconds >= 3600 ? `${target.token_quota.window_seconds / 3600}h` : `${target.token_quota.window_seconds}s`}`}
                       </p>
                     </div>
                     <span className="text-[11px] text-muted-foreground font-mono">{target.id.slice(0, 8)}</span>
@@ -311,6 +359,42 @@ export default function TargetsPage({ token, targets, onRefresh }: Props) {
                         </div>
                       </div>
 
+                      {/* Token Quota inline config */}
+                      <div className="space-y-2 border rounded-md p-3">
+                        <div className="flex items-center gap-2">
+                          <Checkbox
+                            id={`t_quota_enabled_${target.id}`}
+                            defaultChecked={!!target.token_quota}
+                            className="data-[state=checked]:bg-primary"
+                          />
+                          <Label htmlFor={`t_quota_enabled_${target.id}`} className="text-sm font-medium cursor-pointer">Token Quota</Label>
+                        </div>
+                        <div className="grid grid-cols-2 gap-3">
+                          <div className="space-y-1">
+                            <Label className="text-[11px]">Token Limit</Label>
+                            <Input
+                              type="number"
+                              min="1"
+                              defaultValue={target.token_quota?.limit || ''}
+                              id={`t_quota_limit_${target.id}`}
+                              className="h-8 text-xs"
+                              placeholder="e.g. 1000000"
+                            />
+                          </div>
+                          <div className="space-y-1">
+                            <Label className="text-[11px]">Window (seconds)</Label>
+                            <Input
+                              type="number"
+                              min="1"
+                              defaultValue={target.token_quota?.window_seconds || ''}
+                              id={`t_quota_window_${target.id}`}
+                              className="h-8 text-xs"
+                              placeholder="e.g. 86400 (24h)"
+                            />
+                          </div>
+                        </div>
+                      </div>
+
                       {/* Test result */}
                       {testResults[target.id] && (
                         <div
@@ -330,6 +414,16 @@ export default function TargetsPage({ token, targets, onRefresh }: Props) {
                           size="sm"
                           variant="default"
                           onClick={() => {
+                            const quotaCb = document.getElementById(`t_quota_enabled_${target.id}`) as HTMLInputElement
+                            const quotaEnabled = !!quotaCb?.getAttribute('data-state') === true || quotaCb?.getAttribute('aria-checked') === 'true'
+                            const rawLimit = (document.getElementById(`t_quota_limit_${target.id}`) as HTMLInputElement)?.value
+                            const rawWindow = (document.getElementById(`t_quota_window_${target.id}`) as HTMLInputElement)?.value
+                            const qLimit = parseInt(rawLimit, 10)
+                            const qWindow = parseInt(rawWindow, 10)
+                            const token_quota: TokenQuota | null = (quotaEnabled && !isNaN(qLimit) && qLimit > 0 && !isNaN(qWindow) && qWindow > 0)
+                              ? { limit: qLimit, window_seconds: qWindow }
+                              : null
+
                             const payload: Partial<Target> = {
                               name: (document.getElementById(`t_name_${target.id}`) as HTMLInputElement)?.value,
                               api_format: (document.getElementById(`t_api_format_${target.id}`) as HTMLSelectElement)?.value,
@@ -338,6 +432,7 @@ export default function TargetsPage({ token, targets, onRefresh }: Props) {
                               router_model: (document.getElementById(`t_router_model_${target.id}`) as HTMLInputElement)?.value,
                               upstream_model: (document.getElementById(`t_upstream_model_${target.id}`) as HTMLInputElement)?.value,
                               enabled: (document.getElementById(`t_enabled_${target.id}`) as HTMLSelectElement)?.value === 'true',
+                              token_quota,
                             }
                             handleUpdate(target.id, payload)
                           }}

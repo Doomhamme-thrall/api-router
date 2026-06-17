@@ -2,7 +2,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::fs;
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouterConfig {
@@ -33,6 +35,8 @@ pub struct UpstreamTarget {
     pub router_model: String,
     pub upstream_model: String,
     pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_quota: Option<TokenQuota>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +66,8 @@ pub struct UpsertTargetRequest {
     pub router_model: String,
     pub upstream_model: String,
     pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_quota: Option<TokenQuota>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -104,20 +110,64 @@ pub fn normalize_usage_log_dir(input: PathBuf) -> PathBuf {
 }
 
 pub async fn load_config(path: &Path) -> anyhow::Result<RouterConfig> {
-    let body = fs::read_to_string(path)
-        .await
-        .with_context(|| format!("failed to read config from {}", path.display()))?;
+    debug!("loading config from {}", path.display());
+    let body = match fs::read_to_string(path).await {
+        Ok(v) => v,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            warn!(
+                "config file not found at {}, generating default config",
+                path.display()
+            );
+            let cfg = generate_default_config();
+            info!(
+                "default config generated: admin/admin, jwt_secret={}, empty targets/groups",
+                cfg.jwt_secret
+            );
+            save_config(path, &cfg).await?;
+            return Ok(cfg);
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to read config from {}", path.display()));
+        }
+    };
     let cfg: RouterConfig = serde_json::from_str(&body)
         .with_context(|| format!("invalid config json at {}", path.display()))?;
+    debug!("config loaded successfully ({} bytes)", body.len());
     Ok(cfg)
 }
 
 pub async fn save_config(path: &Path, cfg: &RouterConfig) -> anyhow::Result<()> {
+    debug!("saving config to {}", path.display());
     let body = serde_json::to_string_pretty(cfg)?;
     let tmp_path = path.with_extension("json.tmp");
     fs::write(&tmp_path, body).await?;
     fs::rename(tmp_path, path).await?;
+    debug!("config saved to {}", path.display());
     Ok(())
+}
+
+/// Generate a default config with admin/admin credentials and a random JWT secret.
+/// Useful when the config file does not exist on first run.
+fn generate_default_config() -> RouterConfig {
+    let admin = AdminConfig {
+        username: "admin".to_string(),
+        password_sha256: sha256_hex("admin"),
+    };
+    let jwt_secret = uuid::Uuid::new_v4().to_string();
+    RouterConfig {
+        admin,
+        jwt_secret,
+        client_api_keys: Vec::new(),
+        targets: Vec::new(),
+        model_groups: Vec::new(),
+    }
+}
+
+fn sha256_hex(input: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(input.as_bytes());
+    let out = hasher.finalize();
+    hex::encode(out)
 }
 
 pub fn build_upstream_url(base_url: &str, route: &str) -> String {

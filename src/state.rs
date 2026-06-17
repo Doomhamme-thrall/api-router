@@ -22,4 +22,6 @@ pub struct AppState {
     pub max_call_records: usize,
     pub group_usage: Arc<RwLock<HashMap<String, VecDeque<GroupUsageRecord>>>>,
     pub group_usage_log_dir: PathBuf,
+    pub target_usage: Arc<RwLock<HashMap<String, VecDeque<GroupUsageRecord>>>>,
+    pub target_usage_log_dir: PathBuf,
 }

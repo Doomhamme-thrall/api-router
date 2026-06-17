@@ -7,6 +7,7 @@ export interface Target {
   router_model: string
   upstream_model: string
   enabled: boolean
+  token_quota?: TokenQuota | null
 }
 
 export interface ModelGroup {

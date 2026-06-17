@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 use tokio::sync::RwLock;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
-use tracing::info;
+use tracing::{info, debug};
 
 mod admin;
 mod auth;
@@ -37,7 +37,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             std::env::var("RUST_LOG")
-                .unwrap_or_else(|_| "llm_router=info,tower_http=info".to_string()),
+                .unwrap_or_else(|_| "llm_router=debug,tower_http=info".to_string()),
         )
         .init();
 
@@ -45,7 +45,34 @@ async fn main() -> anyhow::Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("config/router.json"));
 
+    info!("llm-router starting up");
+    info!("config path: {}", cfg_path.display());
+
     let cfg = load_config(&cfg_path).await?;
+    info!(
+        "config loaded: {} targets, {} model groups, {} client API keys",
+        cfg.targets.len(),
+        cfg.model_groups.len(),
+        cfg.client_api_keys.len(),
+    );
+
+    // Log each enabled target for debugging
+    for t in &cfg.targets {
+        debug!("target: {} (enabled={}, format={}, router_model={})", t.name, t.enabled, t.api_format, t.router_model);
+    }
+    for g in &cfg.model_groups {
+        debug!(
+            "model group: {} (enabled={}, targets={}, quota={})",
+            g.name,
+            g.enabled,
+            g.target_ids.len(),
+            g.token_quota
+                .as_ref()
+                .map(|q| format!("{}t/{}s", q.limit, q.window_seconds))
+                .unwrap_or_else(|| "none".to_string()),
+        );
+    }
+
     let upstream_timeout_secs = std::env::var("ROUTER_UPSTREAM_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -66,8 +93,14 @@ async fn main() -> anyhow::Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("data/group-usage"));
 
+    let target_usage_log_dir = std::env::var("ROUTER_TARGET_USAGE_LOG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("data/target-usage"));
+
     let existing_records = load_call_records_from_disk(&usage_log_dir, max_call_records).await;
     let existing_group_usage = load_group_usage_from_disk(&group_usage_log_dir).await
+        .unwrap_or_default();
+    let existing_target_usage = load_group_usage_from_disk(&target_usage_log_dir).await
         .unwrap_or_default();
 
     let state = AppState {
@@ -87,6 +120,8 @@ async fn main() -> anyhow::Result<()> {
         max_call_records,
         group_usage: Arc::new(RwLock::new(existing_group_usage)),
         group_usage_log_dir,
+        target_usage: Arc::new(RwLock::new(existing_target_usage)),
+        target_usage_log_dir,
     };
 
     let app = Router::new()
@@ -118,12 +153,15 @@ async fn main() -> anyhow::Result<()> {
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
-    let bind_addr: SocketAddr = std::env::var("ROUTER_BIND")
-        .unwrap_or_else(|_| "0.0.0.0:8080".to_string())
-        .parse()
+    let bind_addr_str = std::env::var("ROUTER_BIND")
+        .unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+    let bind_addr: SocketAddr = bind_addr_str.parse()
         .context("invalid ROUTER_BIND")?;
 
-    info!("llm-router listening on {}", bind_addr);
+    info!(
+        "llm-router listening on {}, routes configured: /v1/chat/completions, /v1/embeddings, /v1/models, /admin/*, /ui/*",
+        bind_addr,
+    );
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     axum::serve(listener, app).await?;
     Ok(())

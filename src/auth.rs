@@ -6,6 +6,7 @@ use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation}
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use tracing::{debug, warn};
 
 use crate::state::AppState;
 
@@ -51,22 +52,27 @@ pub async fn validate_client_api_key(
 ) -> std::result::Result<(), Response> {
     let cfg = state.cfg.read().await;
     if cfg.client_api_keys.is_empty() {
+        debug!("client_api_keys is empty, skipping api key validation");
         return Ok(());
     }
 
     let Some(auth) = headers.get("authorization") else {
+        warn!("missing authorization header for client request");
         return Err(api_error(StatusCode::UNAUTHORIZED, "missing authorization header"));
     };
 
     let Ok(auth) = auth.to_str() else {
+        warn!("invalid authorization header encoding");
         return Err(api_error(StatusCode::UNAUTHORIZED, "invalid authorization header"));
     };
 
     let supplied = auth.strip_prefix("Bearer ").unwrap_or("").trim();
     let ok = cfg.client_api_keys.iter().any(|k| k == supplied);
     if ok {
+        debug!("client api key validated");
         Ok(())
     } else {
+        warn!("invalid client api key provided");
         Err(api_error(StatusCode::UNAUTHORIZED, "invalid api key"))
     }
 }

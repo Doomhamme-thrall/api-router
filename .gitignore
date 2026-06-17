@@ -24,6 +24,7 @@ data/usage/
 
 # ── Local runtime/config secrets ──
 config/router.json
+!config/router.example.json
 
 # ── Python artifacts (for helper scripts) ──
 __pycache__/

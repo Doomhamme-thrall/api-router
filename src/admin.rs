@@ -6,7 +6,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::{json, Value};
-use tracing::error;
+use tracing::{debug, error, info, warn};
 
 use chrono::Utc;
 
@@ -23,9 +23,16 @@ pub async fn admin_login_handler(
     State(state): State<AppState>,
     Json(req): Json<AdminLoginRequest>,
 ) -> Response {
+    info!("admin login attempt: username={}", req.username);
     match admin_login(&state, &req).await {
-        Ok(resp) => Json(resp).into_response(),
-        Err(resp) => resp,
+        Ok(resp) => {
+            info!("admin login success: username={}", req.username);
+            Json(resp).into_response()
+        }
+        Err(resp) => {
+            warn!("admin login failed: username={}", req.username);
+            resp
+        }
     }
 }
 
@@ -49,14 +56,17 @@ pub async fn admin_create_target(
 
     let new_target = crate::config::UpstreamTarget {
         id: uuid::Uuid::new_v4().to_string(),
-        name: req.name,
+        name: req.name.clone(),
         api_format: normalize_api_format(&req.api_format),
         base_url: req.base_url,
         api_key: req.api_key,
         router_model: req.router_model,
         upstream_model: req.upstream_model,
         enabled: req.enabled,
+        token_quota: req.token_quota,
     };
+
+    info!("admin create target: {}", req.name);
 
     {
         let mut cfg = state.cfg.write().await;
@@ -84,9 +94,11 @@ pub async fn admin_update_target(
         let mut cfg = state.cfg.write().await;
         let target = cfg.targets.iter_mut().find(|t| t.id == id);
         let Some(target) = target else {
+            warn!("admin update target not found: {}", id);
             return api_error(StatusCode::NOT_FOUND, "target not found");
         };
 
+        info!("admin update target: {} (id={})", req.name, id);
         target.name = req.name;
         target.api_format = normalize_api_format(&req.api_format);
         target.base_url = req.base_url;
@@ -94,6 +106,7 @@ pub async fn admin_update_target(
         target.router_model = req.router_model;
         target.upstream_model = req.upstream_model;
         target.enabled = req.enabled;
+        target.token_quota = req.token_quota;
 
         if let Err(err) = save_config(&state.cfg_path, &cfg).await {
             error!("failed to save config: {}", err);
@@ -118,8 +131,10 @@ pub async fn admin_delete_target(
         let old_len = cfg.targets.len();
         cfg.targets.retain(|t| t.id != id);
         if cfg.targets.len() == old_len {
+            warn!("admin delete target not found: {}", id);
             return api_error(StatusCode::NOT_FOUND, "target not found");
         }
+        info!("admin delete target: {}", id);
         if let Err(err) = save_config(&state.cfg_path, &cfg).await {
             error!("failed to save config: {}", err);
             return api_error(StatusCode::INTERNAL_SERVER_ERROR, "failed to persist config");
@@ -135,6 +150,7 @@ pub async fn admin_list_model_groups(State(state): State<AppState>, headers: Hea
     }
 
     let cfg = state.cfg.read().await;
+    debug!("admin list model groups: {} items", cfg.model_groups.len());
     Json(json!({"items": cfg.model_groups})).into_response()
 }
 
@@ -147,6 +163,16 @@ pub async fn admin_create_model_group(
         return resp;
     }
 
+    info!(
+        "admin create model group: name={} targets={} quota={}",
+        req.name,
+        req.target_ids.len(),
+        req.token_quota
+            .as_ref()
+            .map(|q| format!("{}t/{}s", q.limit, q.window_seconds))
+            .unwrap_or_else(|| "none".to_string()),
+    );
+
     let new_group = crate::config::ModelGroup {
         id: uuid::Uuid::new_v4().to_string(),
         name: req.name,
@@ -158,6 +184,7 @@ pub async fn admin_create_model_group(
     {
         let mut cfg = state.cfg.write().await;
         if cfg.model_groups.iter().any(|g| g.name == new_group.name) {
+            warn!("admin create model group conflict: name '{}' already exists", new_group.name);
             return api_error(StatusCode::CONFLICT, "model group name already exists");
         }
 
@@ -211,9 +238,20 @@ pub async fn admin_update_model_group(
 
         let group = cfg.model_groups.iter_mut().find(|g| g.id == id);
         let Some(group) = group else {
+            warn!("admin update model group not found: {}", id);
             return api_error(StatusCode::NOT_FOUND, "model group not found");
         };
 
+        info!(
+            "admin update model group: id={} name={} targets={} quota={}",
+            id,
+            req.name,
+            req.target_ids.len(),
+            req.token_quota
+                .as_ref()
+                .map(|q| format!("{}t/{}s", q.limit, q.window_seconds))
+                .unwrap_or_else(|| "none".to_string()),
+        );
         group.name = req.name;
         group.target_ids = req.target_ids;
         group.enabled = req.enabled;
@@ -242,8 +280,10 @@ pub async fn admin_delete_model_group(
         let old_len = cfg.model_groups.len();
         cfg.model_groups.retain(|g| g.id != id);
         if cfg.model_groups.len() == old_len {
+            warn!("admin delete model group not found: {}", id);
             return api_error(StatusCode::NOT_FOUND, "model group not found");
         }
+        info!("admin delete model group: {}", id);
         if let Err(err) = save_config(&state.cfg_path, &cfg).await {
             error!("failed to save config: {}", err);
             return api_error(StatusCode::INTERNAL_SERVER_ERROR, "failed to persist config");
