@@ -24,6 +24,26 @@ use crate::usage::{
     CallRecord, GroupUsageRecord,
 };
 
+/// 将生成的助手内容追加到消息列表中，以便进行续写
+fn append_assistant_content(payload: &mut Value, content: &str) {
+    if content.is_empty() {
+        return;
+    }
+    if let Some(messages) = payload.get_mut("messages").and_then(|v| v.as_array_mut()) {
+        if let Some(last) = messages.last_mut() {
+            if last.get("role").and_then(|v| v.as_str()) == Some("assistant") {
+                if let Some(old_content) = last.get_mut("content") {
+                    if let Some(s) = old_content.as_str() {
+                        *old_content = Value::String(format!("{}{}", s, content));
+                        return;
+                    }
+                }
+            }
+        }
+        messages.push(json!({"role": "assistant", "content": content}));
+    }
+}
+
 pub async fn proxy_chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -187,103 +207,148 @@ async fn proxy_openai_request(
                 );
                 return response;
             } else {
-                // Gemini Streaming
+                // Gemini Streaming with Auto-Resume
                 let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(100);
-                let mut stream = upstream_resp.bytes_stream();
                 let state_clone = state.clone();
                 let target_clone = target.clone();
                 let requested_model_clone = requested_model.clone();
-                let upstream_model_clone = target.upstream_model.clone();
+                let mut current_openai_payload = attempt_payload.clone();
+                
+                let mut first_resp = Some(upstream_resp);
 
                 tokio::spawn(async move {
-                    let mut accumulated_usage = (0, 0, 0);
-                    let mut buffer = Vec::new();
+                    let mut total_prompt_tokens = 0;
+                    let mut total_completion_tokens = 0;
+                    let mut last_was_done = false;
                     let id = format!("chatcmpl-gemini-{}", Utc::now().timestamp_millis());
                     let created = Utc::now().timestamp();
 
-                    while let Some(chunk_res) = stream.next().await {
-                        match chunk_res {
-                            Ok(bytes) => {
-                                buffer.extend_from_slice(&bytes);
-                                
-                                // Gemini stream is a JSON array: [ {obj1}, {obj2} ]
-                                // We need to extract each {obj}.
-                                loop {
-                                    // Skip whitespace/array-syntax
-                                    let mut start_idx = 0;
-                                    while start_idx < buffer.len() && (buffer[start_idx] as char).is_whitespace() || buffer[start_idx] == b'[' || buffer[start_idx] == b',' {
-                                        start_idx += 1;
-                                    }
-                                    if start_idx > 0 {
-                                        buffer.drain(0..start_idx);
-                                    }
-
-                                    if buffer.is_empty() || buffer[0] == b']' {
-                                        break;
-                                    }
-
-                                    // Find end of JSON object
-                                    let mut brace_count = 0;
-                                    let mut end_idx = None;
-                                    let mut in_string = false;
-                                    let mut escaped = false;
-
-                                    for (i, &b) in buffer.iter().enumerate() {
-                                        let c = b as char;
-                                        if escaped {
-                                            escaped = false;
-                                            continue;
-                                        }
-                                        if c == '\\' {
-                                            escaped = true;
-                                            continue;
-                                        }
-                                        if c == '"' {
-                                            in_string = !in_string;
-                                            continue;
-                                        }
-                                        if !in_string {
-                                            if c == '{' {
-                                                brace_count += 1;
-                                            } else if c == '}' {
-                                                brace_count -= 1;
-                                                if brace_count == 0 {
-                                                    end_idx = Some(i + 1);
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    if let Some(i) = end_idx {
-                                        let obj_bytes = buffer.drain(0..i).collect::<Vec<u8>>();
-                                        if let Ok(v) = serde_json::from_slice::<Value>(&obj_bytes) {
-                                            let (sse_text, usage) = gemini_chunk_to_openai_sse(&v, &upstream_model_clone, &id, created);
-                                            if usage.2 > 0 {
-                                                accumulated_usage = usage;
-                                            }
-                                            if tx.send(Ok(Bytes::from(sse_text))).await.is_err() {
-                                                return;
-                                            }
-                                        }
-                                    } else {
-                                        break;
-                                    }
+                    for retry in 0..3 {
+                        let resp = if let Some(r) = first_resp.take() {
+                            r
+                        } else {
+                            // Re-build Gemini payload from updated OpenAI payload
+                            let gemini_payload = match build_gemini_request_payload(&current_openai_payload) {
+                                Ok(v) => v,
+                                Err(err) => {
+                                    error!("gemini resume payload build failed: {}", err);
+                                    break;
+                                }
+                            };
+                            let upstream_url = build_gemini_streaming_url(&target_clone.base_url, &target_clone.upstream_model);
+                            let req = state_clone
+                                .http_client
+                                .post(upstream_url)
+                                .header("Content-Type", "application/json")
+                                .timeout(std::time::Duration::from_secs(state_clone.upstream_timeout_secs))
+                                .query(&[("key", target_clone.api_key.as_str())])
+                                .json(&gemini_payload);
+                            
+                            match req.send().await {
+                                Ok(r) if r.status().is_success() => r,
+                                Ok(r) => {
+                                    warn!("gemini resume retry {} failed with status {}", retry, r.status());
+                                    break;
+                                }
+                                Err(e) => {
+                                    warn!("gemini resume retry {} failed: {}", retry, e);
+                                    break;
                                 }
                             }
-                            Err(err) => {
-                                let _ = tx.send(Err(std::io::Error::new(std::io::ErrorKind::Other, err))).await;
-                                break;
+                        };
+
+                        let mut stream = resp.bytes_stream();
+                        let mut buffer = Vec::new();
+                        let mut current_attempt_text = String::new();
+                        let mut attempt_done = false;
+
+                        while let Some(chunk_res) = stream.next().await {
+                            match chunk_res {
+                                Ok(bytes) => {
+                                    buffer.extend_from_slice(&bytes);
+                                    
+                                    loop {
+                                        // Skip whitespace/array-syntax
+                                        let mut start_idx = 0;
+                                        while start_idx < buffer.len() && ((buffer[start_idx] as char).is_whitespace() || buffer[start_idx] == b'[' || buffer[start_idx] == b',') {
+                                            start_idx += 1;
+                                        }
+                                        if start_idx > 0 { buffer.drain(0..start_idx); }
+                                        if buffer.is_empty() || buffer[0] == b']' { break; }
+
+                                        let mut brace_count = 0;
+                                        let mut end_idx = None;
+                                        let mut in_string = false;
+                                        let mut escaped = false;
+                                        for (i, &b) in buffer.iter().enumerate() {
+                                            let c = b as char;
+                                            if escaped { escaped = false; continue; }
+                                            if c == '\\' { escaped = true; continue; }
+                                            if c == '"' { in_string = !in_string; continue; }
+                                            if !in_string {
+                                                if c == '{' { brace_count += 1; }
+                                                else if c == '}' { brace_count -= 1; if brace_count == 0 { end_idx = Some(i + 1); break; } }
+                                            }
+                                        }
+
+                                        if let Some(i) = end_idx {
+                                            let obj_bytes = buffer.drain(0..i).collect::<Vec<u8>>();
+                                            if let Ok(v) = serde_json::from_slice::<Value>(&obj_bytes) {
+                                                // Extract text for resume
+                                                if let Some(candidates) = v.get("candidates").and_then(|c| c.as_array()) {
+                                                    if let Some(cand) = candidates.first() {
+                                                        if let Some(parts) = cand.get("content").and_then(|c| c.get("parts")).and_then(|p| p.as_array()) {
+                                                            for p in parts {
+                                                                if let Some(t) = p.get("text").and_then(|v| v.as_str()) {
+                                                                    current_attempt_text.push_str(t);
+                                                                }
+                                                            }
+                                                        }
+                                                        if let Some(reason) = cand.get("finishReason").and_then(|v| v.as_str()) {
+                                                            if reason == "STOP" {
+                                                                attempt_done = true;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                // Extract usage
+                                                if let Some(usage) = v.get("usageMetadata") {
+                                                    total_prompt_tokens = usage.get("promptTokenCount").and_then(|v| v.as_u64()).unwrap_or(total_prompt_tokens);
+                                                    total_completion_tokens += usage.get("candidatesTokenCount").and_then(|v| v.as_u64()).unwrap_or(0);
+                                                }
+
+                                                let (sse_text, _) = gemini_chunk_to_openai_sse(&v, &target_clone.upstream_model, &id, created);
+                                                if tx.send(Ok(Bytes::from(sse_text))).await.is_err() {
+                                                    return;
+                                                }
+                                            }
+                                        } else {
+                                            break;
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    warn!("gemini stream error during retry {}: {}", retry, err);
+                                    break;
+                                }
                             }
                         }
+
+                        if attempt_done {
+                            last_was_done = true;
+                            break;
+                        } else {
+                            info!("gemini stream truncated, attempting resume (retry {})", retry + 1);
+                            append_assistant_content(&mut current_openai_payload, &current_attempt_text);
+                        }
                     }
-                    
+
                     let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
 
-                    let (pt, ct, tt) = accumulated_usage;
-                    record_call(&state_clone, &target_clone, true, pt, ct, tt).await;
+                    let tt = total_prompt_tokens + total_completion_tokens;
+                    record_call(&state_clone, &target_clone, true, total_prompt_tokens, total_completion_tokens, tt).await;
                     record_group_usage(&state_clone, requested_model_clone.as_deref(), tt).await;
-                    info!("gemini success (streaming): target={} tokens={}", target_clone.name, tt);
+                    info!("gemini success (streaming with resume): target={} tokens={}", target_clone.name, tt);
                 });
 
                 let body = Body::from_stream(ReceiverStream::new(rx));
@@ -331,87 +396,121 @@ async fn proxy_openai_request(
             .cloned()
             .unwrap_or_else(|| HeaderValue::from_static("application/json"));
 
-        if !is_streaming {
-            match upstream_resp.bytes().await {
-                Ok(bytes) => {
-                    let (pt, ct, tt) = extract_tokens_from_bytes(&bytes);
-                    record_call(&state, &target, true, pt, ct, tt).await;
-                    record_group_usage(&state, requested_model.as_deref(), tt).await;
-                    info!("openai success: target={} tokens={} (pt={}, ct={})", target.name, tt, pt, ct);
-                    let body = Body::from(bytes);
-                    let mut response = Response::new(body);
-                    *response.status_mut() = status;
-                    response.headers_mut().insert("content-type", content_type);
-                    return response;
-                }
-                Err(err) => {
-                    last_err_message = format!("failed to read response body: {}", err);
-                    error!("{}", last_err_message);
-                    record_call(&state, &target, false, 0, 0, 0).await;
-                    continue;
-                }
-            }
         } else {
             let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(100);
-            let mut stream = upstream_resp.bytes_stream();
             let state_clone = state.clone();
             let target_clone = target.clone();
             let requested_model_clone = requested_model.clone();
+            let mut current_payload = attempt_payload.clone();
+            let route_clone = route.to_string();
+            let content_type_clone = content_type.clone();
+            
+            let mut first_resp = Some(upstream_resp);
 
             tokio::spawn(async move {
-                let mut accumulated_usage = (0, 0, 0);
-                let mut full_body = Vec::new(); // keep a copy for usage extraction if not found in stream chunks
+                let mut total_prompt_tokens = 0;
+                let mut total_completion_tokens = 0;
+                let mut last_was_done = false;
 
-                while let Some(chunk_res) = stream.next().await {
-                    match chunk_res {
-                        Ok(bytes) => {
-                            full_body.extend_from_slice(&bytes);
-                            // Try to extract usage from this chunk
-                            if let Ok(text) = std::str::from_utf8(&bytes) {
-                                for line in text.lines() {
-                                    let data = line.strip_prefix("data: ").unwrap_or(line).trim();
-                                    if !data.is_empty() && data != "[DONE]" {
+                for retry in 0..3 {
+                    let resp = if let Some(r) = first_resp.take() {
+                        r
+                    } else {
+                        let upstream_url = build_upstream_url(&target_clone.base_url, &route_clone);
+                        let req = state_clone
+                            .http_client
+                            .post(upstream_url)
+                            .header("Authorization", format!("Bearer {}", target_clone.api_key))
+                            .header("Content-Type", "application/json")
+                            .timeout(std::time::Duration::from_secs(state_clone.upstream_timeout_secs))
+                            .json(&current_payload);
+                        
+                        match req.send().await {
+                            Ok(r) if r.status().is_success() => r,
+                            Ok(r) => {
+                                warn!("openai resume retry {} failed with status {}", retry, r.status());
+                                break;
+                            }
+                            Err(e) => {
+                                warn!("openai resume retry {} failed: {}", retry, e);
+                                break;
+                            }
+                        }
+                    };
+
+                    let mut stream = resp.bytes_stream();
+                    let mut current_attempt_text = String::new();
+                    let mut attempt_done = false;
+
+                    while let Some(chunk_res) = stream.next().await {
+                        match chunk_res {
+                            Ok(bytes) => {
+                                if let Ok(text) = std::str::from_utf8(&bytes) {
+                                    for line in text.lines() {
+                                        let line = line.trim();
+                                        if line.is_empty() { continue; }
+                                        let data = line.strip_prefix("data: ").unwrap_or(line).trim();
+                                        if data == "[DONE]" {
+                                            attempt_done = true;
+                                            continue;
+                                        }
                                         if let Ok(v) = serde_json::from_str::<Value>(data) {
-                                            if let Some(usage) = v.get("usage") {
-                                                let p = usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                                                let c = usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                                                let t = usage.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                                                if t > 0 {
-                                                    accumulated_usage = (p, c, t);
+                                            if let Some(choices) = v.get("choices").and_then(|c| c.as_array()) {
+                                                if let Some(choice) = choices.first() {
+                                                    if let Some(delta) = choice.get("delta") {
+                                                        if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
+                                                            current_attempt_text.push_str(content);
+                                                        }
+                                                    }
+                                                    if let Some(reason) = choice.get("finish_reason").filter(|r| !r.is_null()) {
+                                                        // Stop if it's "stop". If it's "length", we might want to continue.
+                                                        if reason == "stop" {
+                                                            attempt_done = true;
+                                                        }
+                                                    }
                                                 }
+                                            }
+                                            if let Some(usage) = v.get("usage") {
+                                                total_prompt_tokens = usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(total_prompt_tokens);
+                                                total_completion_tokens += usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
                                             }
                                         }
                                     }
                                 }
+                                if tx.send(Ok(bytes)).await.is_err() {
+                                    return; // Client disconnected
+                                }
                             }
-                            if tx.send(Ok(bytes)).await.is_err() {
+                            Err(err) => {
+                                warn!("openai stream error during retry {}: {}", retry, err);
                                 break;
                             }
                         }
-                        Err(err) => {
-                            let _ = tx
-                                .send(Err(std::io::Error::new(std::io::ErrorKind::Other, err)))
-                                .await;
-                            break;
-                        }
+                    }
+
+                    if attempt_done {
+                        last_was_done = true;
+                        break;
+                    } else {
+                        info!("openai stream truncated, attempting resume (retry {})", retry + 1);
+                        append_assistant_content(&mut current_payload, &current_attempt_text);
                     }
                 }
 
-                let (pt, ct, tt) = if accumulated_usage.2 > 0 {
-                    accumulated_usage
-                } else {
-                    extract_tokens_from_sse_bytes(&full_body)
-                };
+                if !last_was_done {
+                    let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
+                }
 
-                record_call(&state_clone, &target_clone, true, pt, ct, tt).await;
+                let tt = total_prompt_tokens + total_completion_tokens;
+                record_call(&state_clone, &target_clone, true, total_prompt_tokens, total_completion_tokens, tt).await;
                 record_group_usage(&state_clone, requested_model_clone.as_deref(), tt).await;
-                info!("openai success (streaming): target={} tokens={}", target_clone.name, tt);
+                info!("openai success (streaming with resume): target={} tokens={}", target_clone.name, tt);
             });
 
             let body = Body::from_stream(ReceiverStream::new(rx));
             let mut response = Response::new(body);
             *response.status_mut() = status;
-            response.headers_mut().insert("content-type", content_type);
+            response.headers_mut().insert("content-type", content_type_clone);
             return response;
         }
     }
