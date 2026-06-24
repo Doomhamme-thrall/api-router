@@ -91,6 +91,20 @@ pub fn build_gemini_upstream_url(base_url: &str, model: &str) -> String {
     format!("{}/v1beta/models/{}:generateContent", base, model)
 }
 
+pub fn build_gemini_streaming_url(base_url: &str, model: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    if base.contains(":streamGenerateContent") {
+        return base.to_string();
+    }
+    if base.contains("/models/") {
+        if base.contains(':') {
+            return base.replace(":generateContent", ":streamGenerateContent");
+        }
+        return format!("{}:streamGenerateContent", base);
+    }
+    format!("{}/v1beta/models/{}:streamGenerateContent", base, model)
+}
+
 fn map_gemini_finish_reason(reason: &str) -> &str {
     match reason {
         "STOP" => "stop",
@@ -206,4 +220,80 @@ pub fn build_openai_sse_from_completion(completion: &Value) -> String {
         first,
         second
     )
+}
+
+pub fn gemini_chunk_to_openai_sse(
+    gemini_chunk: &Value,
+    model: &str,
+    id: &str,
+    created: i64,
+) -> (String, (u64, u64, u64)) {
+    let text = gemini_chunk
+        .get("candidates")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|cand| cand.get("content"))
+        .and_then(|content| content.get("parts"))
+        .and_then(|v| v.as_array())
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|p| p.get("text").and_then(|v| v.as_str()))
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .unwrap_or_default();
+
+    let finish_reason = gemini_chunk
+        .get("candidates")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|cand| cand.get("finishReason"))
+        .and_then(|v| v.as_str())
+        .map(map_gemini_finish_reason);
+
+    let usage = gemini_chunk.get("usageMetadata");
+    let pt = usage
+        .and_then(|u| u.get("promptTokenCount"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let ct = usage
+        .and_then(|u| u.get("candidatesTokenCount"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let tt = usage
+        .and_then(|u| u.get("totalTokenCount"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    let delta = if text.is_empty() && finish_reason.is_none() {
+        json!({"role": "assistant"})
+    } else if !text.is_empty() {
+        json!({"content": text})
+    } else {
+        json!({})
+    };
+
+    let chunk = json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": delta,
+            "finish_reason": finish_reason
+        }],
+        "usage": if tt > 0 {
+            Some(json!({
+                "prompt_tokens": pt,
+                "completion_tokens": ct,
+                "total_tokens": tt
+            }))
+        } else {
+            None
+        }
+    });
+
+    (format!("data: {}\n\n", chunk), (pt, ct, tt))
 }

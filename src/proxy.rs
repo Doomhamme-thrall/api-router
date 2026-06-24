@@ -1,19 +1,21 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::Ordering;
 
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::{State, Json};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
 use chrono::Utc;
+use futures_util::StreamExt;
 use serde_json::{json, Value};
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, info, warn};
 
 use crate::auth::{api_error, validate_client_api_key};
 use crate::config::{is_gemini_format, build_upstream_url};
 use crate::gemini::{
-    build_gemini_request_payload, build_gemini_upstream_url,
-    build_openai_sse_from_completion, gemini_to_openai_chat_completion,
+    build_gemini_request_payload, build_gemini_upstream_url, build_gemini_streaming_url,
+    build_openai_sse_from_completion, gemini_to_openai_chat_completion, gemini_chunk_to_openai_sse,
 };
 use crate::state::AppState;
 use crate::usage::{
@@ -109,7 +111,11 @@ async fn proxy_openai_request(
                 }
             };
 
-            let upstream_url = build_gemini_upstream_url(&target.base_url, &target.upstream_model);
+            let upstream_url = if is_streaming {
+                build_gemini_streaming_url(&target.base_url, &target.upstream_model)
+            } else {
+                build_gemini_upstream_url(&target.base_url, &target.upstream_model)
+            };
             let req = state
                 .http_client
                 .post(upstream_url)
@@ -136,40 +142,40 @@ async fn proxy_openai_request(
                 continue;
             }
 
-            let body_bytes = match upstream_resp.bytes().await {
-                Ok(bytes) => bytes,
-                Err(err) => {
-                    last_err_message = format!("failed to read response body: {}", err);
-                    error!("{}", last_err_message);
-                    record_call(&state, &target, false, 0, 0, 0).await;
-                    continue;
-                }
-            };
-
-            if !status.is_success() {
-                let mut response = Response::new(Body::from(body_bytes));
-                *response.status_mut() = status;
-                response.headers_mut().insert(
-                    "content-type",
-                    HeaderValue::from_static("application/json"),
-                );
-                return response;
-            }
-
-            let gemini_body: Value = match serde_json::from_slice(&body_bytes) {
-                Ok(v) => v,
-                Err(err) => {
-                    last_err_message = format!("invalid gemini response json: {}", err);
-                    error!("{}", last_err_message);
-                    record_call(&state, &target, false, 0, 0, 0).await;
-                    continue;
-                }
-            };
-
-            let openai_like = gemini_to_openai_chat_completion(&gemini_body, &target.upstream_model);
-            let (pt, ct, tt) = extract_tokens_from_value(&openai_like);
-
             if !is_streaming {
+                let body_bytes = match upstream_resp.bytes().await {
+                    Ok(bytes) => bytes,
+                    Err(err) => {
+                        last_err_message = format!("failed to read response body: {}", err);
+                        error!("{}", last_err_message);
+                        record_call(&state, &target, false, 0, 0, 0).await;
+                        continue;
+                    }
+                };
+
+                if !status.is_success() {
+                    let mut response = Response::new(Body::from(body_bytes));
+                    *response.status_mut() = status;
+                    response.headers_mut().insert(
+                        "content-type",
+                        HeaderValue::from_static("application/json"),
+                    );
+                    return response;
+                }
+
+                let gemini_body: Value = match serde_json::from_slice(&body_bytes) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        last_err_message = format!("invalid gemini response json: {}", err);
+                        error!("{}", last_err_message);
+                        record_call(&state, &target, false, 0, 0, 0).await;
+                        continue;
+                    }
+                };
+
+                let openai_like = gemini_to_openai_chat_completion(&gemini_body, &target.upstream_model);
+                let (pt, ct, tt) = extract_tokens_from_value(&openai_like);
+
                 record_call(&state, &target, true, pt, ct, tt).await;
                 record_group_usage(&state, requested_model.as_deref(), tt).await;
                 info!("gemini success: target={} tokens={} (pt={}, ct={})", target.name, tt, pt, ct);
@@ -180,19 +186,115 @@ async fn proxy_openai_request(
                     HeaderValue::from_static("application/json"),
                 );
                 return response;
-            }
+            } else {
+                // Gemini Streaming
+                let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(100);
+                let mut stream = upstream_resp.bytes_stream();
+                let state_clone = state.clone();
+                let target_clone = target.clone();
+                let requested_model_clone = requested_model.clone();
+                let upstream_model_clone = target.upstream_model.clone();
 
-            let sse_body = build_openai_sse_from_completion(&openai_like);
-            record_call(&state, &target, true, pt, ct, tt).await;
-            record_group_usage(&state, requested_model.as_deref(), tt).await;
-            info!("gemini success (streaming): target={} tokens={}", target.name, tt);
-            let mut response = Response::new(Body::from(sse_body));
-            *response.status_mut() = status;
-            response.headers_mut().insert(
-                "content-type",
-                HeaderValue::from_static("text/event-stream"),
-            );
-            return response;
+                tokio::spawn(async move {
+                    let mut accumulated_usage = (0, 0, 0);
+                    let mut buffer = Vec::new();
+                    let id = format!("chatcmpl-gemini-{}", Utc::now().timestamp_millis());
+                    let created = Utc::now().timestamp();
+
+                    while let Some(chunk_res) = stream.next().await {
+                        match chunk_res {
+                            Ok(bytes) => {
+                                buffer.extend_from_slice(&bytes);
+                                
+                                // Gemini stream is a JSON array: [ {obj1}, {obj2} ]
+                                // We need to extract each {obj}.
+                                loop {
+                                    // Skip whitespace/array-syntax
+                                    let mut start_idx = 0;
+                                    while start_idx < buffer.len() && (buffer[start_idx] as char).is_whitespace() || buffer[start_idx] == b'[' || buffer[start_idx] == b',' {
+                                        start_idx += 1;
+                                    }
+                                    if start_idx > 0 {
+                                        buffer.drain(0..start_idx);
+                                    }
+
+                                    if buffer.is_empty() || buffer[0] == b']' {
+                                        break;
+                                    }
+
+                                    // Find end of JSON object
+                                    let mut brace_count = 0;
+                                    let mut end_idx = None;
+                                    let mut in_string = false;
+                                    let mut escaped = false;
+
+                                    for (i, &b) in buffer.iter().enumerate() {
+                                        let c = b as char;
+                                        if escaped {
+                                            escaped = false;
+                                            continue;
+                                        }
+                                        if c == '\\' {
+                                            escaped = true;
+                                            continue;
+                                        }
+                                        if c == '"' {
+                                            in_string = !in_string;
+                                            continue;
+                                        }
+                                        if !in_string {
+                                            if c == '{' {
+                                                brace_count += 1;
+                                            } else if c == '}' {
+                                                brace_count -= 1;
+                                                if brace_count == 0 {
+                                                    end_idx = Some(i + 1);
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if let Some(i) = end_idx {
+                                        let obj_bytes = buffer.drain(0..i).collect::<Vec<u8>>();
+                                        if let Ok(v) = serde_json::from_slice::<Value>(&obj_bytes) {
+                                            let (sse_text, usage) = gemini_chunk_to_openai_sse(&v, &upstream_model_clone, &id, created);
+                                            if usage.2 > 0 {
+                                                accumulated_usage = usage;
+                                            }
+                                            if tx.send(Ok(Bytes::from(sse_text))).await.is_err() {
+                                                return;
+                                            }
+                                        }
+                                    } else {
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                let _ = tx.send(Err(std::io::Error::new(std::io::ErrorKind::Other, err))).await;
+                                break;
+                            }
+                        }
+                    }
+                    
+                    let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
+
+                    let (pt, ct, tt) = accumulated_usage;
+                    record_call(&state_clone, &target_clone, true, pt, ct, tt).await;
+                    record_group_usage(&state_clone, requested_model_clone.as_deref(), tt).await;
+                    info!("gemini success (streaming): target={} tokens={}", target_clone.name, tt);
+                });
+
+                let body = Body::from_stream(ReceiverStream::new(rx));
+                let mut response = Response::new(body);
+                *response.status_mut() = status;
+                response.headers_mut().insert(
+                    "content-type",
+                    HeaderValue::from_static("text/event-stream"),
+                );
+                return response;
+            }
         }
 
         // OpenAI-compatible path
@@ -250,29 +352,67 @@ async fn proxy_openai_request(
                 }
             }
         } else {
-            // For streaming responses, read the full body to extract token usage,
-            // then replay the SSE stream to the client.
-            match upstream_resp.bytes().await {
-                Ok(bytes) => {
-                    let (pt, ct, tt) = extract_tokens_from_sse_bytes(&bytes);
-                    record_call(&state, &target, true, pt, ct, tt).await;
-                    record_group_usage(&state, requested_model.as_deref(), tt).await;
-                    info!("openai success (streaming): target={} tokens={}", target.name, tt);
-                    let body = Body::from(bytes);
-                    let mut response = Response::new(body);
-                    *response.status_mut() = status;
-                    response
-                        .headers_mut()
-                        .insert("content-type", content_type);
-                    return response;
+            let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(100);
+            let mut stream = upstream_resp.bytes_stream();
+            let state_clone = state.clone();
+            let target_clone = target.clone();
+            let requested_model_clone = requested_model.clone();
+
+            tokio::spawn(async move {
+                let mut accumulated_usage = (0, 0, 0);
+                let mut full_body = Vec::new(); // keep a copy for usage extraction if not found in stream chunks
+
+                while let Some(chunk_res) = stream.next().await {
+                    match chunk_res {
+                        Ok(bytes) => {
+                            full_body.extend_from_slice(&bytes);
+                            // Try to extract usage from this chunk
+                            if let Ok(text) = std::str::from_utf8(&bytes) {
+                                for line in text.lines() {
+                                    let data = line.strip_prefix("data: ").unwrap_or(line).trim();
+                                    if !data.is_empty() && data != "[DONE]" {
+                                        if let Ok(v) = serde_json::from_str::<Value>(data) {
+                                            if let Some(usage) = v.get("usage") {
+                                                let p = usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                                                let c = usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                                                let t = usage.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                                                if t > 0 {
+                                                    accumulated_usage = (p, c, t);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if tx.send(Ok(bytes)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(err) => {
+                            let _ = tx
+                                .send(Err(std::io::Error::new(std::io::ErrorKind::Other, err)))
+                                .await;
+                            break;
+                        }
+                    }
                 }
-                Err(err) => {
-                    last_err_message = format!("failed to read streaming response body: {}", err);
-                    error!("{}", last_err_message);
-                    record_call(&state, &target, false, 0, 0, 0).await;
-                    continue;
-                }
-            }
+
+                let (pt, ct, tt) = if accumulated_usage.2 > 0 {
+                    accumulated_usage
+                } else {
+                    extract_tokens_from_sse_bytes(&full_body)
+                };
+
+                record_call(&state_clone, &target_clone, true, pt, ct, tt).await;
+                record_group_usage(&state_clone, requested_model_clone.as_deref(), tt).await;
+                info!("openai success (streaming): target={} tokens={}", target_clone.name, tt);
+            });
+
+            let body = Body::from_stream(ReceiverStream::new(rx));
+            let mut response = Response::new(body);
+            *response.status_mut() = status;
+            response.headers_mut().insert("content-type", content_type);
+            return response;
         }
     }
 
