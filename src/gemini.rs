@@ -178,50 +178,6 @@ pub fn gemini_to_openai_chat_completion(gemini_body: &Value, model: &str) -> Val
     })
 }
 
-pub fn build_openai_sse_from_completion(completion: &Value) -> String {
-    let id = completion
-        .get("id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("chatcmpl-gemini");
-    let created = completion
-        .get("created")
-        .and_then(|v| v.as_i64())
-        .unwrap_or_else(|| Utc::now().timestamp());
-    let model = completion
-        .get("model")
-        .and_then(|v| v.as_str())
-        .unwrap_or("gemini");
-    let text = completion
-        .get("choices")
-        .and_then(|v| v.as_array())
-        .and_then(|arr| arr.first())
-        .and_then(|c| c.get("message"))
-        .and_then(|m| m.get("content"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    let first = json!({
-        "id": id,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": model,
-        "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": Value::Null}]
-    });
-    let second = json!({
-        "id": id,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": model,
-        "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": "stop"}]
-    });
-
-    format!(
-        "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
-        first,
-        second
-    )
-}
-
 pub fn gemini_chunk_to_openai_sse(
     gemini_chunk: &Value,
     model: &str,

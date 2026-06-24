@@ -8,6 +8,7 @@ use axum::response::Response;
 use chrono::Utc;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
+use tokio::time::{sleep, Duration};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, info, warn};
 
@@ -15,14 +16,81 @@ use crate::auth::{api_error, validate_client_api_key};
 use crate::config::{is_gemini_format, build_upstream_url};
 use crate::gemini::{
     build_gemini_request_payload, build_gemini_upstream_url, build_gemini_streaming_url,
-    build_openai_sse_from_completion, gemini_to_openai_chat_completion, gemini_chunk_to_openai_sse,
+    gemini_to_openai_chat_completion, gemini_chunk_to_openai_sse,
 };
 use crate::state::AppState;
 use crate::usage::{
     append_call_record_to_disk, append_group_usage_to_disk, extract_tokens_from_bytes,
-    extract_tokens_from_sse_bytes, extract_tokens_from_value, sum_group_tokens_in_window,
+    extract_tokens_from_value, sum_group_tokens_in_window,
     CallRecord, GroupUsageRecord,
 };
+
+/// 判断错误是否为临时性的（可重试）
+fn is_transient_error(err: &reqwest::Error) -> bool {
+    if err.is_timeout() || err.is_connect() {
+        return true;
+    }
+    // "error decoding response body" — compression/decompression failure,
+    // typically caused by truncated streaming body; treat as transient
+    let text = err.to_string();
+    if text.contains("error decoding response body")
+        || text.contains("broken pipe")
+        || text.contains("connection closed")
+        || text.contains("connection reset")
+        || text.contains("Connection reset by peer")
+        || text.contains("stream ended")
+    {
+        return true;
+    }
+    false
+}
+
+/// 判断 HTTP 状态码是否可重试
+fn is_retryable_status(status: StatusCode) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+}
+
+/// 带指数退避的异步重试
+async fn retry_with_backoff<F, Fut, T>(
+    operation: F,
+    max_retries: u32,
+    target_name: &str,
+) -> Result<T, String>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<T, (bool, String)>>,
+{
+    let mut last_err = String::new();
+    for attempt in 0..=max_retries {
+        match operation().await {
+            Ok(val) => return Ok(val),
+            Err((retryable, msg)) => {
+                last_err = msg.clone();
+                if retryable && attempt < max_retries {
+                    let delay = Duration::from_millis(100 * (1u64 << attempt) + rand_delay_ms());
+                    info!(
+                        "retry attempt {}/{} for target={}: {} (retrying in {}ms)",
+                        attempt + 1, max_retries, target_name, msg, delay.as_millis(),
+                    );
+                    sleep(delay).await;
+                } else {
+                    return Err(last_err);
+                }
+            }
+        }
+    }
+    Err(last_err)
+}
+
+fn rand_delay_ms() -> u64 {
+    // Simple jitter using the low bits of time
+    (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as u64)
+        % 50
+}
 
 /// 将生成的助手内容追加到消息列表中，以便进行续写
 fn append_assistant_content(payload: &mut Value, content: &str) {
@@ -136,18 +204,46 @@ async fn proxy_openai_request(
             } else {
                 build_gemini_upstream_url(&target.base_url, &target.upstream_model)
             };
-            let req = state
-                .http_client
-                .post(upstream_url)
-                .header("Content-Type", "application/json")
-                .timeout(std::time::Duration::from_secs(state.upstream_timeout_secs))
-                .query(&[("key", target.api_key.as_str())])
-                .json(&gemini_payload);
 
-            let upstream_resp = match req.send().await {
+            let upstream_resp = match retry_with_backoff(
+                || {
+                    let timeout_secs = if is_streaming {
+                        std::cmp::max(state.upstream_timeout_secs * 4, 300)
+                    } else {
+                        state.upstream_timeout_secs
+                    };
+                    let req = state
+                        .http_client
+                        .post(upstream_url.clone())
+                        .header("Content-Type", "application/json")
+                        .timeout(std::time::Duration::from_secs(timeout_secs))
+                        .query(&[("key", target.api_key.as_str())])
+                        .json(&gemini_payload);
+                    async move {
+                        match req.send().await {
+                            Ok(resp) => {
+                                let status = resp.status();
+                                if is_retryable_status(status) {
+                                    Err((true, format!("upstream status {}", status)))
+                                } else {
+                                    Ok(resp)
+                                }
+                            }
+                            Err(err) => {
+                                let retryable = is_transient_error(&err);
+                                Err((retryable, format!("upstream request failed: {}", err)))
+                            }
+                        }
+                    }
+                },
+                2,
+                &target.name,
+            )
+            .await
+            {
                 Ok(resp) => resp,
-                Err(err) => {
-                    last_err_message = format!("upstream request failed: {}", err);
+                Err(msg) => {
+                    last_err_message = msg;
                     error!("{}", last_err_message);
                     record_call(&state, &target, false, 0, 0, 0).await;
                     continue;
@@ -166,6 +262,11 @@ async fn proxy_openai_request(
                 let body_bytes = match upstream_resp.bytes().await {
                     Ok(bytes) => bytes,
                     Err(err) => {
+                        let retryable = is_transient_error(&err);
+                        warn!(
+                            "gemini non-stream body read failed (retryable={}): {}",
+                            retryable, err
+                        );
                         last_err_message = format!("failed to read response body: {}", err);
                         error!("{}", last_err_message);
                         record_call(&state, &target, false, 0, 0, 0).await;
@@ -219,7 +320,6 @@ async fn proxy_openai_request(
                 tokio::spawn(async move {
                     let mut total_prompt_tokens = 0;
                     let mut total_completion_tokens = 0;
-                    let mut last_was_done = false;
                     let id = format!("chatcmpl-gemini-{}", Utc::now().timestamp_millis());
                     let created = Utc::now().timestamp();
 
@@ -335,7 +435,6 @@ async fn proxy_openai_request(
                         }
 
                         if attempt_done {
-                            last_was_done = true;
                             break;
                         } else {
                             info!("gemini stream truncated, attempting resume (retry {})", retry + 1);
@@ -364,18 +463,46 @@ async fn proxy_openai_request(
 
         // OpenAI-compatible path
         let upstream_url = build_upstream_url(&target.base_url, route);
-        let req = state
-            .http_client
-            .post(upstream_url)
-            .header("Authorization", format!("Bearer {}", target.api_key))
-            .header("Content-Type", "application/json")
-            .timeout(std::time::Duration::from_secs(state.upstream_timeout_secs))
-            .json(&attempt_payload);
 
-        let upstream_resp = match req.send().await {
+        let upstream_resp = match retry_with_backoff(
+            || {
+                let timeout_secs = if is_streaming {
+                    std::cmp::max(state.upstream_timeout_secs * 4, 300)
+                } else {
+                    state.upstream_timeout_secs
+                };
+                let req = state
+                    .http_client
+                    .post(upstream_url.clone())
+                    .header("Authorization", format!("Bearer {}", target.api_key.clone()))
+                    .header("Content-Type", "application/json")
+                    .timeout(std::time::Duration::from_secs(timeout_secs))
+                    .json(&attempt_payload);
+                async move {
+                    match req.send().await {
+                        Ok(resp) => {
+                            let status = resp.status();
+                            if is_retryable_status(status) {
+                                Err((true, format!("upstream status {}", status)))
+                            } else {
+                                Ok(resp)
+                            }
+                        }
+                        Err(err) => {
+                            let retryable = is_transient_error(&err);
+                            Err((retryable, format!("upstream request failed: {}", err)))
+                        }
+                    }
+                }
+            },
+            2,
+            &target.name,
+        )
+        .await
+        {
             Ok(resp) => resp,
-            Err(err) => {
-                last_err_message = format!("upstream request failed: {}", err);
+            Err(msg) => {
+                last_err_message = msg;
                 error!("{}", last_err_message);
                 record_call(&state, &target, false, 0, 0, 0).await;
                 continue;
@@ -383,8 +510,9 @@ async fn proxy_openai_request(
         };
 
         let status = upstream_resp.status();
-        if status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS {
-            last_err_message = format!("upstream status {}", status);
+        if is_retryable_status(status) {
+            // Already retried above; now just log and move on
+            last_err_message = format!("upstream status {} after retries", status);
             error!("{}", last_err_message);
             record_call(&state, &target, false, 0, 0, 0).await;
             continue;
@@ -396,6 +524,42 @@ async fn proxy_openai_request(
             .cloned()
             .unwrap_or_else(|| HeaderValue::from_static("application/json"));
 
+        if !is_streaming {
+            match upstream_resp.bytes().await {
+                Ok(bytes) => {
+                    let (pt, ct, tt) = extract_tokens_from_bytes(&bytes);
+                    record_call(&state, &target, true, pt, ct, tt).await;
+                    record_group_usage(&state, requested_model.as_deref(), tt).await;
+                    info!("openai success: target={} tokens={} (pt={}, ct={})", target.name, tt, pt, ct);
+                    let body = Body::from(bytes);
+                    let mut response = Response::new(body);
+                    *response.status_mut() = status;
+                    response.headers_mut().insert("content-type", content_type);
+                    return response;
+                }
+                Err(err) => {
+                    let retryable = is_transient_error(&err);
+                    warn!(
+                        "openai non-stream body read failed (retryable={}): {}",
+                        retryable, err
+                    );
+                    // Non-streaming body decode failure: re-send the full request
+                    // (The request-level retry_with_backoff above handles connection errors,
+                    //  but decompression errors happen after headers are received.)
+                    if retryable {
+                        // Skip this target — the request-level retry already ran.
+                        // If this is a decompression/per-connection error, try the next target.
+                        last_err_message = format!("failed to read response body: {}", err);
+                        error!("{}", last_err_message);
+                        record_call(&state, &target, false, 0, 0, 0).await;
+                        continue;
+                    }
+                    last_err_message = format!("failed to read response body: {}", err);
+                    error!("{}", last_err_message);
+                    record_call(&state, &target, false, 0, 0, 0).await;
+                    continue;
+                }
+            }
         } else {
             let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(100);
             let state_clone = state.clone();

@@ -110,9 +110,12 @@ async fn main() -> anyhow::Result<()> {
         rr_index: Arc::new(AtomicUsize::new(0)),
         group_rr_index: Arc::new(RwLock::new(HashMap::new())),
         http_client: Client::builder()
-            .pool_idle_timeout(std::time::Duration::from_secs(60))
-            .tcp_keepalive(std::time::Duration::from_secs(30))
-            .connect_timeout(std::time::Duration::from_secs(8))
+            .user_agent("llm-router/1.0")
+            .pool_idle_timeout(std::time::Duration::from_secs(30))
+            .pool_max_idle_per_host(2)
+            .tcp_keepalive(std::time::Duration::from_secs(15))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .http1_only()
             .build()
             .context("failed to build reqwest client")?,
         upstream_timeout_secs,

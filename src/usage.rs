@@ -50,30 +50,6 @@ pub fn extract_tokens_from_bytes(bytes: &[u8]) -> (u64, u64, u64) {
     (0, 0, 0)
 }
 
-pub fn extract_tokens_from_sse_bytes(bytes: &[u8]) -> (u64, u64, u64) {
-    let text = match std::str::from_utf8(bytes) {
-        Ok(s) => s,
-        Err(_) => return (0, 0, 0),
-    };
-
-    let mut last_usage: Option<(u64, u64, u64)> = None;
-    for line in text.lines() {
-        let data = line.strip_prefix("data: ").unwrap_or(line).trim();
-        if data == "[DONE]" || data.is_empty() {
-            continue;
-        }
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
-            if let Some(usage) = v.get("usage") {
-                let prompt = usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                let completion = usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                let total = usage.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                last_usage = Some((prompt, completion, total));
-            }
-        }
-    }
-    last_usage.unwrap_or((0, 0, 0))
-}
-
 pub fn extract_tokens_from_value(v: &serde_json::Value) -> (u64, u64, u64) {
     let usage = v.get("usage").and_then(|v| v.as_object());
     let prompt = usage
